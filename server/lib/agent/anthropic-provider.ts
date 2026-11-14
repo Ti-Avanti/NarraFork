@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { NativeMediaInput } from "@shared/media-attachments";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
@@ -31,6 +32,7 @@ import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isCompletionLimitReason, ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { reportInputCharacters } from "./input-characters";
+import { rejectNativeMedia, storedMessageMedia } from "./native-media";
 import { buildOpencodeSessionHeader, isOpencodeEndpoint } from "./opencode-session";
 import {
 	type NeutralTurn,
@@ -847,6 +849,8 @@ interface AnthropicUsageAccum {
 	cacheCreationInputTokens: number;
 	cacheCreation5mTokens: number;
 	cacheCreation1hTokens: number;
+	/** Any usage payload in this response carried a cache counter field (even 0). */
+	cacheReported: boolean;
 	/** Text lanes tracked alongside the per-response usage state. */
 	textBlocks?: Set<number>;
 }
@@ -859,6 +863,7 @@ function createAnthropicUsageAccum(): AnthropicUsageAccum {
 		cacheCreationInputTokens: 0,
 		cacheCreation5mTokens: 0,
 		cacheCreation1hTokens: 0,
+		cacheReported: false,
 	};
 }
 
@@ -878,6 +883,13 @@ function updateAnthropicUsageAccum(
 	partUsage: AnthropicUsagePayload | undefined,
 ): void {
 	if (!partUsage) return;
+	if (
+		partUsage.cache_read_input_tokens != null ||
+		partUsage.cache_creation_input_tokens != null ||
+		partUsage.cache_creation != null
+	) {
+		usage.cacheReported = true;
+	}
 	if (isPositiveTokenCount(partUsage.input_tokens)) usage.inputTokens = partUsage.input_tokens;
 	if (isPositiveTokenCount(partUsage.cache_read_input_tokens)) {
 		usage.cachedInputTokens = partUsage.cache_read_input_tokens;
@@ -920,6 +932,7 @@ function parsedUsageFromAnthropicAccum(
 			cacheCreationInputTokens: usage.cacheCreationInputTokens,
 			cacheCreation5mTokens: usage.cacheCreation5mTokens,
 			cacheCreation1hTokens: usage.cacheCreation1hTokens,
+			cacheReported: usage.cacheReported,
 			...(contextWindow != null && { contextWindow }),
 		},
 	};
@@ -1619,15 +1632,23 @@ export class AnthropicProvider implements ProviderAdapter {
 		return rebuildOriginal();
 	}
 
+	supportsNativeMediaInput(
+		_media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		_model: string,
+	): boolean {
+		return false;
+	}
+
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		return tools.map(formatAnthropicTool);
 	}
 
 	async buildHistory(
-		dbMessages: DbMessage[],
+		dbMessages: readonly DbMessage[],
 		model: string,
 		narratorId?: string,
 	): Promise<BuiltHistory> {
+		rejectNativeMedia("Anthropic Messages", dbMessages.flatMap(storedMessageMedia));
 		// narratorId is required to resolve history images: an uploaded image is
 		// stored per narrator and the row only carries its id, so without the owner
 		// the bytes cannot be found. It used to be ignored here, which silently
@@ -1669,6 +1690,7 @@ export class AnthropicProvider implements ProviderAdapter {
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		rejectNativeMedia("Anthropic Messages", [params.media, params.history, params.toolResults]);
 		const apiKey = this.config.apiKey;
 
 		if (!apiKey) {
@@ -3001,7 +3023,7 @@ export function parseAnthropicEvent(
 // === History builder ===
 
 async function buildAnthropicHistory(
-	dbMessages: DbMessage[],
+	dbMessages: readonly DbMessage[],
 	currentReasoningSource?: string,
 	useMidConversationSystemRole = false,
 	narratorId?: string,

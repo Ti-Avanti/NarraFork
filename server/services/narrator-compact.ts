@@ -36,6 +36,7 @@ import {
 	compactLocks,
 	markActiveHistoryCompactPending,
 	resetActiveUpstreamSession,
+	withNarratorMutationAdmission,
 	withNarratorWorkAdmission,
 } from "./narrator-session-state";
 import { narratorStore } from "./narrator-store";
@@ -426,6 +427,15 @@ function compactAttemptNumber(message: unknown): number | undefined {
 	return block ? normalizeCompactAttempts(block.attempts).at(-1)?.attempt : undefined;
 }
 
+/** The `before` occupancy a marker already carries, if any. */
+function recordedCompactContextBefore(message: unknown): number | undefined {
+	if (!message || typeof message !== "object" || !("contentJson" in message)) return undefined;
+	const contentJson = (message as { contentJson?: unknown }).contentJson;
+	const blocks = Array.isArray(contentJson) ? contentJson : [];
+	const block = blocks.map(parseCompactMessageBlock).find(Boolean);
+	return typeof block?.contextPercentBefore === "number" ? block.contextPercentBefore : undefined;
+}
+
 function compactReplacementFields(options: CustomCompactOptions | undefined): {
 	oldMessageId?: string;
 	replacedMessageId?: string;
@@ -646,6 +656,7 @@ async function attachBuildHistoryTokenEstimate<T extends MessageWithSeq>(
 	narratorId: string,
 	locale: Locale,
 	message: T,
+	options: { recordCompactAfter?: boolean } = {},
 ): Promise<{ message: T; contextPercent?: number }> {
 	try {
 		const estimate = await estimateNarratorBuildHistoryTokens(narratorId, locale);
@@ -655,10 +666,24 @@ async function attachBuildHistoryTokenEstimate<T extends MessageWithSeq>(
 			narratorId,
 			estimate,
 		);
-		return {
-			message: (updated ? { ...updated, seq: updated.seq ?? message.seq } : message) as T,
-			contextPercent: estimate.contextPercent,
-		};
+		let resolved = updated ? { ...message, ...updated, seq: updated.seq ?? message.seq } : message;
+		if (options.recordCompactAfter && estimate.contextPercent != null) {
+			// The marker must show what the compact left in the narrator's own window.
+			// This estimate is the only place that number exists, so it is written here
+			// instead of leaving the marker without an `after`.
+			const marked = await narratorService
+				.setCompactContextPercent(narratorId, message.id, { after: estimate.contextPercent })
+				.catch((err) => {
+					logger.warn("Failed to record context occupancy after compact", {
+						narratorId,
+						messageId: message.id,
+						error: String(err),
+					});
+					return null;
+				});
+			if (marked) resolved = { ...resolved, ...marked, seq: resolved.seq };
+		}
+		return { message: resolved, contextPercent: estimate.contextPercent };
 	} catch (err) {
 		logger.warn("Failed to estimate build history tokens after compact", {
 			narratorId,
@@ -666,6 +691,90 @@ async function attachBuildHistoryTokenEstimate<T extends MessageWithSeq>(
 			error: String(err),
 		});
 		return { message };
+	}
+}
+
+/**
+ * The narrator's own context occupancy right now, as a percentage of its model's window.
+ *
+ * Compact `before` uses it, and `after` is the same estimate taken once the summary is
+ * committed — one measure for both ends, so the pair the UI shows is directly comparable.
+ * The summary model's own request occupancy is a different number on a different window
+ * and must never be used for either end.
+ *
+ * Unknown is `undefined`: a compact never fails because a display label could not be
+ * estimated.
+ */
+async function estimateContextOccupancyPercent(
+	narratorId: string,
+	locale: Locale,
+	signal?: AbortSignal,
+): Promise<number | undefined> {
+	try {
+		const estimate = await estimateNarratorBuildHistoryTokens(narratorId, locale, { signal });
+		return estimate?.contextPercent;
+	} catch (err) {
+		logger.warn("Failed to estimate context occupancy for compact", {
+			narratorId,
+			error: String(err),
+		});
+		return undefined;
+	}
+}
+
+/**
+ * Re-measure a committed compact's `after` occupancy.
+ *
+ * Editing a summary changes how much history the next request carries, so the percentage
+ * shown for that compact has to move with it. Callers await this: the editor refetches the
+ * detail as soon as the save resolves. A failed re-measure keeps the previous value — the
+ * edit itself already landed.
+ */
+export async function refreshCompactContextPercentAfter(
+	narratorId: string,
+	messageId: string,
+	locale: Locale,
+): Promise<number | undefined> {
+	try {
+		// The current history only describes this compact while it is still the latest
+		// boundary and nothing was added after it; otherwise keep the recorded value rather
+		// than overwrite it with an occupancy that includes later turns.
+		if (!(await narratorService.isCompactAfterRemeasurable(narratorId, messageId))) {
+			return undefined;
+		}
+		// The editor waits on this response, so keep the re-measure short: past a few seconds
+		// the stale-looking percentage is worth less than the save returning promptly.
+		const estimate = await estimateNarratorBuildHistoryTokens(narratorId, locale, {
+			deadline: Date.now() + 5_000,
+		});
+		if (estimate?.contextPercent == null) {
+			logger.warn("Compact context occupancy unavailable after summary edit", {
+				narratorId,
+				messageId,
+				reason: estimate ? "no context window" : "estimate unavailable",
+			});
+			return undefined;
+		}
+		const updated = await narratorService.updateMessageHistoryTokenEstimate(
+			messageId,
+			narratorId,
+			estimate,
+		);
+		const marked = await narratorService.setCompactContextPercent(narratorId, messageId, {
+			after: estimate.contextPercent,
+		});
+		const message = marked ?? (updated?.seq != null ? updated : null);
+		if (message) {
+			broadcastToNarrator(narratorId, { type: "message_updated", narratorId, message });
+		}
+		return estimate.contextPercent;
+	} catch (err) {
+		logger.warn("Failed to refresh compact context occupancy after summary edit", {
+			narratorId,
+			messageId,
+			error: String(err),
+		});
+		return undefined;
 	}
 }
 
@@ -1058,6 +1167,30 @@ async function doRunCustomCompact({
 	await setCompactingSubstatus(narratorId, mode, true);
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode });
 
+	// Record what this compact is about to change. The marker is already live, so the
+	// estimate never delays the "compacting" UI, but it lands before the summary request
+	// so a finalize can never race it. Callers that already know the occupancy (an
+	// auto-compact reporting the turn's real usage) and retries reusing a marker that
+	// carries its own `before` skip the estimate entirely.
+	if (
+		options?.contextPercentBefore == null &&
+		recordedCompactContextBefore(compactingMsg) == null
+	) {
+		const beforePercent = await estimateContextOccupancyPercent(narratorId, locale, signal);
+		if (beforePercent != null) {
+			await narratorService
+				.setCompactContextPercent(narratorId, compactingMsg.id, { before: beforePercent })
+				.catch((err) => {
+					logger.warn("Failed to record context occupancy before compact", {
+						narratorId,
+						messageId: compactingMsg.id,
+						error: String(err),
+					});
+					return null;
+				});
+		}
+	}
+
 	let contextWindowSource: ModelContextWindowSource | undefined;
 	let compactProgress: CompactProgressReporter | undefined;
 
@@ -1080,7 +1213,7 @@ async function doRunCustomCompact({
 		// internal backoff chain and the whole-chunk retry in narrator-context), so
 		// the UI's "retrying (N)" ordinal never resets or goes backwards mid-run.
 		let retryCount = 0;
-		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
+		const { summary, contextPercent, workState } = await narratorContext.generateCompactSummary(
 			narratorId,
 			locale,
 			messages,
@@ -1107,44 +1240,53 @@ async function doRunCustomCompact({
 		const finalSummary = appendHint ? `${summary}\n\n${appendHint}` : summary;
 
 		const finalizeMode = currentHistoryCompactMode(narratorId, mode);
-		const compactedMsg = await narratorService.finalizeCompactingMessage(
-			compactingMsg.id,
-			narratorId,
-			finalSummary,
-			contextPercent,
-			{
-				mode: finalizeMode,
-				expectedAttempt,
-				expectedSeq,
-				epoch: compactEpochRecord(activeNarrators.get(narratorId)),
-				...(options?.preparedRetryMessage
-					? {
-							expectedCompactBoundaryMessageId:
-								options.preparedRetryMessage.compactBoundaryMessageId,
-						}
-					: {}),
-			},
-		);
-		if (!compactedMsg) {
-			throw new AppError(
-				"Compact marker disappeared or its attempt changed before finalize",
-				409,
-				"COMPACT_FINALIZE_CONFLICT",
+		// Only publication is admitted, never the remote summary request. Share the
+		// claim mutex so durable clearing and the live persistence baseline move
+		// together even when a PostgreSQL conversation-id claim is still awaiting IO.
+		const compactedMsg = await withNarratorMutationAdmission(narratorId, async () => {
+			if (signal?.aborted) throw compactAbortError();
+			const committed = await narratorService.finalizeCompactingMessage(
+				compactingMsg.id,
+				narratorId,
+				finalSummary,
+				contextPercent,
+				{
+					mode: finalizeMode,
+					workState,
+					workStateLocale: locale,
+					expectedAttempt,
+					expectedSeq,
+					epoch: compactEpochRecord(activeNarrators.get(narratorId)),
+					...(options?.preparedRetryMessage
+						? {
+								expectedCompactBoundaryMessageId:
+									options.preparedRetryMessage.compactBoundaryMessageId,
+							}
+						: {}),
+				},
 			);
-		}
+			if (!committed) {
+				throw new AppError(
+					"Compact marker disappeared or its attempt changed before finalize",
+					409,
+					"COMPACT_FINALIZE_CONFLICT",
+				);
+			}
+			resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
+			// Do not let another background compact consume the old in-memory history.
+			markActiveHistoryCompactPending(narratorId, committed.seq ?? null);
+			return committed;
+		});
 
-		resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
-		// Record that a history compact has completed but the active agent loop
-		// has not yet rebuilt its in-memory history from the new summary. This
-		// guards against a second background compact firing on the same (stale)
-		// context before the first one is consumed, which previously dropped a
-		// large chunk of context.
-		markActiveHistoryCompactPending(narratorId, compactedMsg?.seq ?? null);
-
-		let contextPercentAfter = contextPercent;
+		// Only the narrator's own post-compact occupancy is a valid `after`. The summary
+		// request's occupancy is measured against the SUMMARY model's window, so keeping it
+		// as a fallback would publish a percentage of the wrong window; unknown stays unknown.
+		let contextPercentAfter: number | undefined;
 		if (compactedMsg) {
-			const estimated = await attachBuildHistoryTokenEstimate(narratorId, locale, compactedMsg);
-			contextPercentAfter = estimated.contextPercent ?? contextPercentAfter;
+			const estimated = await attachBuildHistoryTokenEstimate(narratorId, locale, compactedMsg, {
+				recordCompactAfter: true,
+			});
+			contextPercentAfter = estimated.contextPercent;
 			const compactUpdatedEvent = {
 				type: "message_updated" as const,
 				narratorId,
@@ -1503,7 +1645,7 @@ async function doRunSegmentCompact({
 		// Same retry-visibility contract as the history path: every scheduled retry
 		// bumps one ordinal the UI can show instead of a silent 0-char spinner.
 		let segmentRetryCount = 0;
-		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
+		const { summary, contextPercent, workState } = await narratorContext.generateCompactSummary(
 			narratorId,
 			locale,
 			messages,
@@ -1528,7 +1670,15 @@ async function doRunSegmentCompact({
 			narratorId,
 			summary,
 			contextPercent,
+			{ workState, workStateLocale: locale },
 		);
+		if (!finalizedMsg) {
+			throw new AppError(
+				"Segment compact marker disappeared before finalize",
+				409,
+				"COMPACT_FINALIZE_CONFLICT",
+			);
+		}
 
 		let contextPercentAfter = contextPercent;
 		if (finalizedMsg) {
@@ -1719,7 +1869,13 @@ async function runPlanCompactUnlocked(narratorId: string, planText: string): Pro
 
 	// persistPlanMessage atomically inserts the message, sets isCompact=1,
 	// and updates narrator's contextSummary + clears apiConversationId.
-	const compactMsg = await narratorService.persistPlanMessage(narratorId, planText);
+	const compactMsg = await withNarratorMutationAdmission(narratorId, async () => {
+		const committed = await narratorService.persistPlanMessage(narratorId, planText);
+		// Every caller (normal loop, denied retry and persisted recovery) observes the
+		// durable clear and live CAS baseline together; no lock-free caller reset.
+		if (committed) resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
+		return committed;
+	});
 	if (compactMsg) {
 		broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactMsg });
 	}

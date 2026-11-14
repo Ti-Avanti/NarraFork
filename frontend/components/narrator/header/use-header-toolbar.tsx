@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import {
 	type Dispatch,
 	type ReactNode,
@@ -64,6 +65,11 @@ export interface UseHeaderToolbarOptions {
 
 	// Inline options (self-contained entries).
 	updateExecutionDeviceMutation: MutationLike;
+	/**
+	 * Ask for a device's working directory instead of switching to an unconfigured one.
+	 * The dialog itself is mounted by the panel, outside these menus.
+	 */
+	onRequireDeviceDirectory: (deviceId: string) => void;
 	renderLod: RenderLod;
 	renderLodIsDefault: boolean;
 	handleSelectLod: (lod: RenderLod) => void;
@@ -118,6 +124,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		toggleTerminalTool,
 		toggleSpecTool,
 		updateExecutionDeviceMutation,
+		onRequireDeviceDirectory,
 		renderLod,
 		renderLodIsDefault,
 		handleSelectLod,
@@ -131,6 +138,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 
 	const toolbarEntryEnabled = useCallback(
 		(id: NarratorToolbarId): boolean => {
+			if (REMOTE_BUILD && id !== "lodlevel") return false;
 			switch (id) {
 				case "tasks":
 					return tasksSupported && tasksButtonEnabled;
@@ -190,6 +198,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 	/** Whether an entry's panel is currently open (drives the active styling). */
 	const toolbarEntryActive = useCallback(
 		(id: NarratorToolbarId): boolean => {
+			if (REMOTE_BUILD && id !== "lodlevel") return false;
 			switch (id) {
 				case "tasks":
 					return dock ? dock.openToolTypes.has("tasks") : mobileTasksOpen;
@@ -209,6 +218,8 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 					return dock ? dock.openToolTypes.has("userchat") : mobileToolPanel === "userchat";
 				case "filetree":
 					return dock ? dock.openToolTypes.has("filetree") : mobileToolPanel === "filetree";
+				case "timeline":
+					return dock ? dock.openToolTypes.has("timeline") : mobileToolPanel === "timeline";
 				default:
 					return false;
 			}
@@ -225,6 +236,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 	 */
 	const activateToolbarEntry = useCallback(
 		(id: string) => {
+			if (REMOTE_BUILD && id !== "lodlevel") return;
 			switch (id) {
 				case "path-rules":
 					setPathRulesOpened(true);
@@ -247,6 +259,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "browser":
 				case "userchat":
 				case "filetree":
+				case "timeline":
 					if (dock) dock.toggleToolPanel(id);
 					else {
 						const kind = id as MobileToolPanelKind;
@@ -289,6 +302,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 	 */
 	const renderToolbarInlineOptions = useCallback(
 		(id: string, close: () => void): ReactNode => {
+			if (REMOTE_BUILD && id !== "lodlevel") return null;
 			switch (id) {
 				case "device":
 					return (
@@ -296,8 +310,14 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 							label={t("executionDeviceSelector")}
 							localLabel={t("executionTargetLocal")}
 							offlineLabel={t("executionDeviceOffline")}
+							noDirectoryLabel={t("executionDeviceNoDirectory")}
+							directories={executionDevicesQuery.data?.directories}
 							devices={executionDevicesQuery.data?.devices ?? []}
 							currentDeviceId={executionDevicesQuery.data?.defaultDeviceId ?? "local"}
+							onRequireDirectory={(deviceId) => {
+								close();
+								onRequireDeviceDirectory(deviceId);
+							}}
 							onSelect={(deviceId) => {
 								close();
 								updateExecutionDeviceMutation.mutate(deviceId);
@@ -340,6 +360,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			hostSurface,
 			executionDevicesQuery.data,
 			updateExecutionDeviceMutation,
+			onRequireDeviceDirectory,
 			renderLod,
 			renderLodIsDefault,
 			handleSelectLod,
@@ -354,7 +375,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			toolbarSurfacedDefs,
 			toolbarTuckedDefs,
 			toolbarBottomDefs,
-			toolbarOverlays: (
+			toolbarOverlays: REMOTE_BUILD ? null : (
 				<PathRulesPopover
 					narratorId={narratorId}
 					t={t}

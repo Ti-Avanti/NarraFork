@@ -1,4 +1,5 @@
 import type { RuntimePolicy } from "@server/services/agent-runtime/policy";
+import type { ContextEvidenceBudget } from "@server/services/context-evidence-budget";
 import type {
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
@@ -7,11 +8,16 @@ import type {
 	ReasoningProviderMetadata,
 	ReferencePricingSnapshot,
 } from "@shared/agent-protocol/types";
+import type {
+	MediaContentBlock,
+	NativeMediaFallbackWarning,
+	NativeMediaInput,
+} from "@shared/media-attachments";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
 import type { PathFlavor } from "./execution/backend";
-import { OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOLS } from "./tools/outline-names";
+import { OUTLINE_ASK_TOOL, OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOLS } from "./tools/outline-names";
 
 // === API error and bounded diagnostics ===
 
@@ -343,6 +349,15 @@ export interface ToolResult {
 	fatal?: boolean;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	/** Images already persisted by the tool; do not load their bytes in the loop. */
+	imageRefs?: Extract<
+		import("@shared/agent-protocol/tool-output").ToolOutputImageRef,
+		{ uploadNarratorId: string }
+	>[];
+	/** Actual bytes for the next provider request, never persisted in events. */
+	media?: NativeMediaInput[];
+	/** Durable asset references used to reconstruct native media on history replay. */
+	mediaRefs?: MediaContentBlock[];
 }
 
 export interface ToolDefinition {
@@ -428,6 +443,7 @@ export type AllowPermissionResult = Extract<PermissionResult, { behavior: "allow
 // === Agent events (yielded by the loop) ===
 
 export type AgentEvent =
+	| { type: "media_fallback"; warnings: NativeMediaFallbackWarning[] }
 	| {
 			type: "assistant_message";
 			/** False when an errored/truncated response is retained for already-started tools. */
@@ -479,9 +495,15 @@ export type AgentEvent =
 			completedAt?: number;
 			brokenInputOverride?: Record<string, unknown>;
 			updatedInput?: Record<string, unknown>;
+			mediaRefs?: MediaContentBlock[];
 			metadata?: Record<string, unknown>;
 			/** Images the tool returned; the consumer saves them and stores references. */
 			images?: Array<{ format: string; base64: string }>;
+			/** Images already persisted by the tool; preserve references without loading bytes. */
+			imageRefs?: Extract<
+				import("@shared/agent-protocol/tool-output").ToolOutputImageRef,
+				{ uploadNarratorId: string }
+			>[];
 	  }
 	/**
 	 * The tool passed its permission gate and final admission — execution begins NOW.
@@ -699,7 +721,7 @@ export type AgentEvent =
 			/** `channel:bareModel` id used to match this model in `/v1/models`. */
 			nugModelId?: string;
 			/** How recovery is awaited; `credentials` when omitted. */
-			waitKind?: "credentials" | "quota";
+			waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 			/** Which plan a `quota` wait belongs to; `kimi` when omitted (older events). */
 			quotaProvider?: import("@shared/agent-protocol/quota-exhausted").QuotaProviderKind;
 			/** Window that refused (`fiveHour`, `weekly`, `monthly`, `rateLimit`, …). */
@@ -767,7 +789,10 @@ export type AgentEvent =
 	| {
 			type: "image_generation";
 			id: string;
+			/** `completed` is authoritative only when a final payload has a result. */
 			status: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			result?: string;
 			partialImageIndex?: number;
@@ -777,6 +802,7 @@ export type AgentEvent =
 			width?: number;
 			height?: number;
 			outputIndex?: number;
+			final?: boolean;
 	  }
 	| {
 			type: "model_switched";
@@ -808,9 +834,13 @@ export type AgentEvent =
 				cacheCreationInputTokens?: number;
 				cacheCreation5mTokens?: number;
 				cacheCreation1hTokens?: number;
+				/** See ParsedStreamEvent.usage.cacheReported. */
+				cacheReported?: boolean;
 			};
 			ttftMs?: number;
 			durationMs?: number;
+			/** First persistable content → request end; absent when no content arrived. */
+			decodeMs?: number;
 			contextPercent?: number;
 			meterUsage?: number;
 			meterUnit?: string;
@@ -877,11 +907,15 @@ export type ContentBlock =
 	| {
 			type: "image_generation";
 			id: string;
+			status?: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			result?: string;
 			savedPath?: string;
 			partialSavedPath?: string;
 			partialImageIndex?: number;
+			partialImageB64?: string;
 			outputIndex?: number;
 			width?: number;
 			height?: number;
@@ -918,6 +952,8 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	...OUTLINE_READ_TOOLS,
 	// Planning writes the outline: OutlineEdit then writes only the session's own space.
 	OUTLINE_EDIT_TOOL,
+	// A question for a person is no change to the plan (outline P2 PR 7).
+	OUTLINE_ASK_TOOL,
 ]);
 
 // === Agent config ===
@@ -964,9 +1000,12 @@ export interface AgentHistoryReplacement {
 	history: unknown[];
 	/** The rows `history` was built from; they replace the loop's transcript. */
 	rows: readonly import("./provider").DbMessage[];
+	mediaFallbackWarnings?: NativeMediaFallbackWarning[];
 	systemPrompt?: string;
 	/** Persisted input rows the rebuilt history carries. */
 	replayedInjectionMessageIds?: readonly string[];
+	/** Optional evidence intentionally excluded by budget, not a model-delivery receipt. */
+	omittedOptionalMessageIds?: readonly string[];
 	/** Loading state of the rebuilt history; the `tools` array is re-derived from it. */
 	toolLoading?: import("./tool-loading").ToolLoadingState;
 	/** The same registry candidates used to build `toolLoading`; applied only together with it. */
@@ -996,6 +1035,18 @@ export interface AgentConfig {
 	signal: AbortSignal;
 	/** Resolved by server runtime assembly; DB authorization remains the final authority. */
 	runtimePolicy?: RuntimePolicy;
+	/**
+	 * Where this session's tasks live (`services/task-source`), resolved once per pass. Under
+	 * `outline` every tool route to `spec://` answers with a hint to use the outline tools
+	 * instead, and taskReflection never runs. Absent means spec.
+	 */
+	taskBackend?: "spec" | "outline";
+	/**
+	 * With `taskBackend` `outline`: the session is one the Dynamic Spec import moved into the
+	 * outline (outline P2 PR 12b2), so a `spec://` call is answered with where its old tasks,
+	 * notes and behavior boundary went.
+	 */
+	specImported?: boolean;
 	/**
 	 * This narrator is a bot: people see only what it delivers with `Send({ user })`, so
 	 * Send offers that target. Shapes the offered schema only; the bot trait is re-read
@@ -1153,6 +1204,8 @@ export interface AgentConfig {
 	 * to a fresh per-call set (legacy behaviour for standalone/test callers).
 	 */
 	knowledgeInjectedEntryIds?: Set<string>;
+	/** One request-local allowance shared by memory and both knowledge injection points. */
+	evidenceBudget?: ContextEvidenceBudget;
 	/** Compact cycle seq used when persisting knowledge-injection ledger events. */
 	knowledgeInjectionCompactSeq?: number;
 	/** Reasoning effort — maps to thinking config (Anthropic) or reasoning config (Codex) */
@@ -1205,6 +1258,10 @@ export interface AgentConfig {
 		options?: PermissionHandlerOptions,
 	) => Promise<PermissionResult>;
 	onEvent?: (event: AgentEvent) => void;
+	/** Awaited before every actual provider request, including retries and auxiliary
+	 * reflections. Unlike history hooks, this survives reflection configuration and
+	 * does not require prefix/tool-loading state. Rejection must prevent dispatch. */
+	beforeProviderRequest?: () => Promise<void>;
 	/**
 	 * Called before each non-first turn in the agent loop.
 	 * If it returns a rebuilt history, the loop replaces its history and transcript —

@@ -43,7 +43,8 @@ import { managerChildTokenEnv } from "../lib/manager-token";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { createUpdateFetchContext, type UpdateFetchContext } from "../lib/net/update-fetch";
-import { replacementLaunchArgs } from "../lib/replacement-launch";
+import { replacementLaunchArgs, spawnReplacementProcess } from "../lib/replacement-launch";
+import { IS_LOCAL_RUNTIME, isCompiledRuntime } from "../lib/runtime-target";
 import {
 	beginGracefulRestartSession,
 	cancelGracefulRestartSession,
@@ -303,12 +304,11 @@ function getPlatform(): string {
 /**
  * Get the current executable path.
  * For compiled binaries, this is the running executable.
- * For dev mode, returns null.
+ * For source development and local launch artifacts, returns null.
  */
 function getCurrentExecutablePath(): string | null {
-	// Check if running as compiled binary
-	// Linux/macOS: $bunfs, Windows: ~BUN/%7EBUN
-	if (import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/")) {
+	// Local launch artifacts are frozen source builds, not release installations.
+	if (!IS_LOCAL_RUNTIME && isCompiledRuntime()) {
 		return process.execPath;
 	}
 	return null;
@@ -649,6 +649,12 @@ export async function downloadUpdate(
 	placed?: boolean;
 	preparedIdentity?: PreparedUpdateIdentity;
 }> {
+	if (IS_LOCAL_RUNTIME) {
+		return {
+			success: false,
+			error: "Local runtime builds must be rebuilt from source, not self-updated",
+		};
+	}
 	const forceDownload = options.forceDownload ?? false;
 	const sourceIdentity = parseUpdateSourceIdentity(releaseInfo.sourceIdentity);
 	let recoveryManifestVersions: number[];
@@ -1141,7 +1147,9 @@ export function getUpdateInstructions(
 	if (!execPath) {
 		return {
 			manual: true,
-			message: "Running in development mode. Update rebuilt and saved to the update cache.",
+			message: IS_LOCAL_RUNTIME
+				? "Local runtime builds must be rebuilt from source, not self-updated"
+				: "Running in development mode. Update rebuilt and saved to the update cache.",
 		};
 	}
 
@@ -1276,6 +1284,13 @@ export async function applyUpdate(
 	replacementPid?: number;
 	drainStartedAt?: string;
 }> {
+	if (IS_LOCAL_RUNTIME) {
+		return {
+			success: false,
+			error: "Local runtime builds must be rebuilt from source, not self-updated",
+			code: "NOT_COMPILED_BINARY",
+		};
+	}
 	if (!options.preparedId || !/^[a-f0-9]{64}$/.test(options.preparedId)) {
 		return {
 			success: false,
@@ -1872,46 +1887,23 @@ async function drainAndSpawnPreparedUpdate(options: {
 			NARRAFORK_GRACEFUL_RESTART_MARKER_PATH: session.markerPath,
 			NARRAFORK_GRACEFUL_RESTART_MARKER_NONCE: session.markerNonce,
 		};
-		const isWindows = process.platform === "win32";
 		const launchArgs = replacementLaunchArgs(process.argv.slice(2), {
 			platform: process.platform,
 			managerManaged: process.env.NARRAFORK_MANAGER_MANAGED === "1",
 		});
-		const proc = isWindows
-			? Bun.spawn(
-					[
-						process.env.ComSpec || "cmd.exe",
-						"/d",
-						"/c",
-						"start",
-						"",
-						"/D",
-						process.cwd(),
-						options.newExecPath,
-						...launchArgs,
-					],
-					{
-						cwd: process.cwd(),
-						env,
-						stdio: ["ignore", "ignore", "ignore"],
-						windowsHide: true,
-					},
-				)
-			: Bun.spawn([options.newExecPath, ...launchArgs], {
-					cwd: process.cwd(),
-					env,
-					detached: true,
-					stdio: ["ignore", "ignore", "ignore"],
-				});
-		(proc as { unref?: () => void }).unref?.();
+		const replacementPid = spawnReplacementProcess({
+			execPath: options.newExecPath,
+			args: launchArgs,
+			cwd: process.cwd(),
+			env,
+		});
 
 		logger.info("Update replacement server spawned after scheduled drain", {
 			oldExecPath: options.execPath,
 			newExecPath: options.newExecPath,
 			targetVersion: options.targetVersion,
-			replacementPid: isWindows ? undefined : proc.pid,
-			launcherPid: isWindows ? proc.pid : undefined,
-			launchMode: isWindows ? "cmd-start" : "detached",
+			replacementPid,
+			launchMode: process.platform === "win32" ? "windows-breakaway" : "detached",
 			handoffUrl: session.url,
 			markerPath: session.markerPath,
 		});

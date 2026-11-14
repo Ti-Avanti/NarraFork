@@ -3,6 +3,7 @@ import { chatApi } from "./chat";
 import { apiBase } from "./client";
 import { commandCodeApi } from "./commandcode";
 import { containersApi } from "./containers";
+import { contextMemoryApi } from "./context-memory";
 import { devicesApi } from "./devices";
 import { gitApi } from "./git";
 import { grammarsApi } from "./grammars";
@@ -21,6 +22,7 @@ import { scheduledTasksApi } from "./scheduled-tasks";
 import { sessionInterchangeApi } from "./session-interchange";
 import { settingsApi } from "./settings";
 import { specApi } from "./spec";
+import { storageTransferApi } from "./storage-transfer";
 import { systemLifecycleApi } from "./system-lifecycle";
 import { terminalsApi } from "./terminals";
 import { tokendanceApi } from "./tokendance";
@@ -31,10 +33,30 @@ export function getAvatarUrl(userId: string, avatarImageId: string): string {
 	return `${apiBase()}/uploads/avatars/${userId}/${avatarImageId}`;
 }
 
+/**
+ * URL of an image in a narrator's upload store, fetched with the session token.
+ *
+ * `contextNarratorId` is the narrator the image is shown in. When it is not the owner
+ * (a fork showing its source's image), the server is told which history to check, so a
+ * reader of the fork needs no access to the source session. Same contract as the media
+ * route's `referencingNarratorId`.
+ */
+export function getUploadedImageUrl(
+	uploadNarratorId: string,
+	imageId: string,
+	contextNarratorId?: string | null,
+): string {
+	const url = `${apiBase()}/uploads/${encodeURIComponent(uploadNarratorId)}/${encodeURIComponent(imageId)}`;
+	return contextNarratorId && contextNarratorId !== uploadNarratorId
+		? `${url}?referencingNarratorId=${encodeURIComponent(contextNarratorId)}`
+		: url;
+}
+
 export const api = {
 	...authApi,
 	...projectsApi,
 	...containersApi,
+	...contextMemoryApi,
 	...chatApi,
 	...narratorsApi,
 	...notificationsApi,
@@ -58,16 +80,20 @@ export const api = {
 	...pluginsApi,
 	...sessionInterchangeApi,
 	...commandCodeApi,
+	...storageTransferApi,
 	...providerImportApi,
 };
 
 export {
 	type AdminAuthConfig,
+	type AdminLdapConfig,
 	type AdminOidcProvider,
 	type AdminWebauthnConfig,
 	type CreatedRegistrationCode,
 	isMfaChallenge,
 	isPasskeySupported,
+	type LdapProbeResult,
+	type LdapProbeStage,
 	type LoginResult,
 	type LoginSession,
 	type MfaChallenge,
@@ -268,6 +294,8 @@ export type {
 	LicenseTextSource,
 	MessageLocationResult,
 	PaginatedNarrators,
+	PromptLibraryEntryData,
+	PromptLibraryInputData,
 	PublicCodexPlanTier,
 	PublicCodexQuotaOverview,
 	PublicCodexQuotaSegment,
@@ -283,6 +311,12 @@ export type {
 	StorageCategoryJobState,
 	StorageCategoryKey,
 	StorageCategoryResult,
+	StorageHistoryJob,
+	StorageHistoryJobs,
+	StorageHistoryPreview,
+	StorageRetentionRule,
+	StorageRetentionSettings,
+	StorageRetentionTarget,
 	StorageScanJobState,
 	StorageScanJobStatus,
 	StorageScanResult,

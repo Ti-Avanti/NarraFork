@@ -51,7 +51,12 @@ afterAll(() => {
 function appForRole(role: "admin" | "user") {
 	const app = new Hono();
 	app.use("*", async (c, next) => {
-		c.set("user", { sub: `${role}-id`, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		c.set("user", {
+			sub: role === "admin" ? ADMIN_ACTOR_ID : NON_ADMIN_ACTOR_ID,
+			role,
+			iat: 0,
+			exp: Number.MAX_SAFE_INTEGER,
+		});
 		await next();
 	});
 	app.onError((error) => {
@@ -185,6 +190,50 @@ describe("search channel settings validation", () => {
 });
 
 describe("settings restart redirects", () => {
+	test("defaults and toggles TLS autoReissue without restarting the listener", async () => {
+		const original = structuredClone(settings);
+		const previousSuppressRestart = process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+		let restartCalls = 0;
+		try {
+			delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+			registerServerRestart((host, port) => {
+				restartCalls += 1;
+				return { host, port, protocol: "https" };
+			});
+			const { issueServerCert } = await import("../../lib/tls");
+			const { certPath, keyPath } = await issueServerCert([]);
+			const tls = { enabled: true, certFile: certPath, keyFile: keyPath };
+			saveSettings({ ...settings, server: { ...settings.server, tls } });
+			expect(settings.server.tls?.autoReissue).toBeUndefined();
+
+			for (const autoReissue of [undefined, false]) {
+				const response = await appForRole("admin").request("http://localhost/settings", {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ server: { tls: { ...tls, autoReissue } } }),
+				});
+				const body = (await response.json()) as {
+					serverRestarting?: boolean;
+					server: { tls: typeof tls & { autoReissue: boolean } };
+				};
+				expect(response.status).toBe(200);
+				expect(restartCalls).toBe(0);
+				// The response omits this flag when no restart is needed.
+				expect(body.serverRestarting ?? false).toBe(false);
+				const expectedTls = { ...tls, autoReissue: autoReissue ?? true };
+				expect(settings.server.tls).toEqual(expectedTls);
+				expect(body.server.tls).toEqual(expectedTls);
+			}
+		} finally {
+			saveSettings(original);
+			registerServerRestart(null);
+			if (previousSuppressRestart === undefined) {
+				delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+			} else {
+				process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART = previousSuppressRestart;
+			}
+		}
+	});
 	test.each([
 		"/settings/generate-tls",
 		"/tls/generate",
@@ -828,6 +877,61 @@ describe("default project directory", () => {
 			expect((await patchProjectDir(existing)).status).toBe(200);
 			expect((await patchProjectDir("")).status).toBe(200);
 			expect(settings.paths.defaultProjectDir).toBe("");
+		} finally {
+			saveSettings(original);
+		}
+	});
+});
+
+describe("optional context evidence configuration", () => {
+	test("PATCH retains bounded budgets, retrieval modes and explicit disabled values", () => {
+		for (const bytes of [0, 16384, 65536]) {
+			for (const retrievalMode of ["keywords", "hybrid"] as const) {
+				const patch = {
+					agent: { contextEvidenceBudgetBytes: bytes },
+					knowledge: { injectMode: "off" as const, retrievalMode, scanToolOutput: false },
+				};
+				expect(updateSettingsSchema.parse(patch)).toEqual(patch);
+			}
+		}
+	});
+
+	test("invalid evidence settings fail instead of silently disappearing", () => {
+		for (const bytes of [-1, 0.5, 65537, "16", null]) {
+			expect(
+				updateSettingsSchema.safeParse({ agent: { contextEvidenceBudgetBytes: bytes } }).success,
+			).toBe(false);
+		}
+		for (const knowledge of [
+			{ injectMode: "full" },
+			{ retrievalMode: "vector" },
+			{ scanToolOutput: "false" },
+		])
+			expect(updateSettingsSchema.safeParse({ knowledge }).success).toBe(false);
+	});
+
+	test("only admins can persist evidence settings and unrelated knowledge limits survive", async () => {
+		const original = structuredClone(settings);
+		const patch = {
+			agent: { contextEvidenceBudgetBytes: 0 },
+			knowledge: { injectMode: "off", retrievalMode: "hybrid", scanToolOutput: false },
+		};
+		const request = () => ({
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(patch),
+		});
+		try {
+			expect(
+				(await appForRole("user").request("http://localhost/settings", request())).status,
+			).toBe(403);
+			expect(settings.knowledge).toEqual(original.knowledge);
+			const response = await appForRole("admin").request("http://localhost/settings", request());
+			expect(response.status).toBe(200);
+			const result = await response.json();
+			expect(result.agent.contextEvidenceBudgetBytes).toBe(0);
+			expect(result.knowledge).toEqual({ ...original.knowledge, ...patch.knowledge });
+			expect(settings.knowledge).toEqual(result.knowledge);
 		} finally {
 			saveSettings(original);
 		}

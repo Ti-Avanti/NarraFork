@@ -3,6 +3,7 @@ import * as agent from "../../lib/agent";
 import { estimateTokens } from "../../lib/agent/estimate-tokens";
 import * as provider from "../../lib/agent/provider";
 import * as requestTracker from "../../lib/api-request-tracker";
+import { replaceModelOverridesForTests } from "../../lib/model-catalog";
 import * as prompts from "../../lib/prompt-i18n";
 import { settings } from "../../lib/settings";
 import { narratorService } from "../narrator-service";
@@ -11,9 +12,12 @@ import * as taskSource from "../task-source";
 
 const { narratorContext } = await import("../narrator-context");
 
-/** Compact reads only `compactContext` from the narrator's task source. */
+/** Supply both live-task reads used by compact and its structured handoff. */
 function compactOnlyTaskSource(compactContext: () => Promise<string | null>): NarratorTaskSource {
-	return { compactContext } as unknown as NarratorTaskSource;
+	return {
+		compactContext,
+		openTasks: async () => ({ revision: null, tasks: [] }),
+	} as unknown as NarratorTaskSource;
 }
 
 const originalSummarizeChunk = narratorContext._summarizeChunk.bind(narratorContext);
@@ -143,7 +147,6 @@ describe("question inputs in actual summary provider requests", () => {
 	const normalOutput = { text: `NORMAL_OUTPUT_START${"x".repeat(50_000)}NORMAL_OUTPUT_END` };
 	const model = "anthropic:claude-haiku-4-5";
 	const originalSummary = settings.agent.summaryModel;
-	const originalCatalog = settings.agent.modelCatalog;
 	const generateText = mock(async (_text: string, _model: string, _system?: string) => ({
 		text: "Saved summary",
 	}));
@@ -216,7 +219,7 @@ describe("question inputs in actual summary provider requests", () => {
 	beforeEach(() => {
 		generateText.mockClear();
 		settings.agent.summaryModel = model;
-		settings.agent.modelCatalog = catalogWithWindow(model, 40_000);
+		withWindow(model, 40_000);
 		getNarrator = spyOn(narratorService, "getById").mockImplementation((async () => ({
 			id: "n-question-summary",
 			contextSummary: "",
@@ -242,7 +245,7 @@ describe("question inputs in actual summary provider requests", () => {
 		tracking.mockRestore();
 		spec.mockRestore();
 		settings.agent.summaryModel = originalSummary;
-		settings.agent.modelCatalog = originalCatalog;
+		restoreWindows();
 	});
 
 	for (const kind of ["compact", "fork"] as const) {
@@ -316,6 +319,114 @@ describe("question inputs in actual summary provider requests", () => {
 		});
 	}
 
+	for (const kind of ["compact", "fork"] as const) {
+		test(`${kind} carries host-observed work state independently of model prose`, async () => {
+			getNarrator.mockResolvedValue({
+				id: "n-question-summary",
+				contextSummary: "",
+				cwd: "E:/old",
+				defaultDeviceId: "local",
+				workspaceRevision: 7,
+				contextProjectId: "p-authorized",
+				workspaceContext: { cwd: "/remote/repo", deviceId: "remote-1", revision: 7 },
+			} as never);
+			const tasks = {
+				revision: "tasks-revision",
+				tasks: [{ text: "WAIT_FOR_USER_APPROVAL", status: "blocked", protected: true }],
+			};
+			spec.mockResolvedValue({
+				compactContext: async () => "",
+				openTasks: async () => tasks,
+			} as unknown as NarratorTaskSource);
+			const rows = [
+				{
+					id: "running-message",
+					role: "assistant" as const,
+					contentText: "Running a tool",
+					toolCalls: [
+						{
+							toolUseId: "receipt-id",
+							toolName: "Bash",
+							status: "running",
+							inputJson: { token: "SECRET_INPUT" },
+							outputJson: { secret: "SECRET_OUTPUT" },
+						},
+					],
+				},
+			];
+			history.mockResolvedValue(rows as never);
+			let snapshot: unknown;
+			if (kind === "compact") {
+				const result = await narratorContext.generateCompactSummary(
+					"n-question-summary",
+					"en",
+					rows,
+				);
+				snapshot = result.workState;
+			} else {
+				const summary = await narratorContext.generateContextSummary("n-question-summary", "en", {
+					throwOnFailure: true,
+				});
+				expect(summary).toContain("not authorization");
+				snapshot = JSON.parse(
+					summary.match(/<work_state>\s*([\s\S]*?)\s*<\/work_state>/)?.[1] ?? "null",
+				);
+			}
+			expect(snapshot).toMatchObject({
+				version: 1,
+				narratorId: "n-question-summary",
+				workspace: {
+					cwd: "/remote/repo",
+					deviceId: "remote-1",
+					revision: 7,
+					projectId: "p-authorized",
+				},
+				tasks: { ...tasks, status: "available", omitted: 0 },
+				receipts: [
+					{
+						messageId: "running-message",
+						toolUseId: "receipt-id",
+						toolName: "Bash",
+						status: "running",
+					},
+				],
+			});
+			expect(JSON.stringify(snapshot)).not.toContain("SECRET_");
+		});
+	}
+
+	test("compact records unavailable task state instead of an empty success", async () => {
+		spec.mockResolvedValue({
+			compactContext: async () => null,
+			openTasks: async () => {
+				throw new Error("unavailable");
+			},
+		} as unknown as NarratorTaskSource);
+		const result = await narratorContext.generateCompactSummary(
+			"n-question-summary",
+			"en",
+			sourceRows(true),
+		);
+		expect(result.workState?.tasks.status).toBe("unavailable");
+	});
+
+	test("non-strict fork does not disguise an empty summary as successful context", async () => {
+		history.mockResolvedValue(sourceRows(true) as never);
+		generateText.mockResolvedValueOnce({ text: "" });
+		expect(await narratorContext.generateContextSummary("n-question-summary", "en")).toBe("");
+	});
+
+	for (const text of ["", "   "]) {
+		test(`strict fork rejects an empty summary (${JSON.stringify(text)})`, async () => {
+			history.mockResolvedValue(sourceRows(true) as never);
+			generateText.mockResolvedValueOnce({ text });
+			await expect(
+				narratorContext.generateContextSummary("n-question-summary", "en", {
+					throwOnFailure: true,
+				}),
+			).rejects.toThrow("empty summary");
+		});
+	}
 	test("fork with assistant prose still includes the synchronous question answer", async () => {
 		const rows = sourceRows(true);
 		rows[0].contentText = "The assistant asked a question.";
@@ -333,18 +444,15 @@ describe("question inputs in actual summary provider requests", () => {
 	});
 });
 
-/** A provider entry's own working window, held where production holds it: the catalog. */
-function catalogWithWindow(model: string, window: number) {
-	return {
-		schemaVersion: 2 as const,
-		migrationVersion: 2 as const,
-		autoApply: false,
-		pinnedVersion: null,
-		local: {
-			revision: 0,
-			connections: { [model]: { working_context_tokens: window } },
-		},
-	};
+/** A provider entry's own working window, as the provider page saves it (in memory only). */
+const windowRestores: Array<() => void> = [];
+function withWindow(model: string, window: number): void {
+	windowRestores.push(
+		replaceModelOverridesForTests({ connections: { [model]: { contextWindow: window } } }),
+	);
+}
+function restoreWindows(): void {
+	while (windowRestores.length) windowRestores.pop()?.();
 }
 
 describe("compact context-window budget guard", () => {
@@ -367,11 +475,10 @@ describe("compact context-window budget guard", () => {
 
 			const originalDefault = settings.agent.defaultModel;
 			const originalSummary = settings.agent.summaryModel;
-			const originalCatalog = settings.agent.modelCatalog;
 			// 512 * 0.8 = 409 token budget — below the real fixed prompt overhead.
 			settings.agent.defaultModel = "anthropic:claude-haiku-4-5";
 			settings.agent.summaryModel = "anthropic:claude-haiku-4-5";
-			settings.agent.modelCatalog = catalogWithWindow("anthropic:claude-haiku-4-5", 512);
+			withWindow("anthropic:claude-haiku-4-5", 512);
 
 			try {
 				await expect(narratorContext.generateCompactSummary("n-budget", "en")).rejects.toThrow(
@@ -380,7 +487,7 @@ describe("compact context-window budget guard", () => {
 			} finally {
 				settings.agent.defaultModel = originalDefault;
 				settings.agent.summaryModel = originalSummary;
-				settings.agent.modelCatalog = originalCatalog;
+				restoreWindows();
 			}
 		} finally {
 			narratorService.getById = originalGetById;
@@ -392,7 +499,6 @@ describe("compact context-window budget guard", () => {
 describe("compact small positive budgets use actual request capacity", () => {
 	const model = "anthropic:claude-haiku-4-5";
 	const originalSummary = settings.agent.summaryModel;
-	const originalCatalog = settings.agent.modelCatalog;
 	let previousSummary = "";
 	let specContext = "";
 	const message = { id: "small", role: "user" as const, contentText: "Keep the evidence" };
@@ -406,7 +512,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 		previousSummary = "";
 		specContext = "";
 		settings.agent.summaryModel = model;
-		settings.agent.modelCatalog = catalogWithWindow(model, 1_200);
+		withWindow(model, 1_200);
 		getNarrator = spyOn(narratorService, "getById").mockImplementation((async () => ({
 			id: "n-small",
 			contextSummary: previousSummary,
@@ -426,7 +532,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 		toolHint.mockRestore();
 		spec.mockRestore();
 		settings.agent.summaryModel = originalSummary;
-		settings.agent.modelCatalog = originalCatalog;
+		restoreWindows();
 	});
 
 	function assertRequestFits(window = 1_200) {
@@ -455,7 +561,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 	});
 
 	test("a positive budget still rejects an unsplittable entry that cannot fit", async () => {
-		settings.agent.modelCatalog = catalogWithWindow(model, 250);
+		withWindow(model, 250);
 		const oversized = { ...message, contentText: "evidence".repeat(100) };
 		await expect(
 			narratorContext.generateCompactSummary("n-small", "en", [oversized]),
@@ -464,7 +570,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 	});
 
 	test("fixed overhead that cannot fit fails with its context-window hint", async () => {
-		settings.agent.modelCatalog = catalogWithWindow(model, 1);
+		withWindow(model, 1);
 		await expect(
 			narratorContext.generateCompactSummary("n-small", "en", [message]),
 		).rejects.toThrow(/context window/i);
@@ -487,7 +593,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 	});
 
 	test("cancellation takes priority over an impossible budget or empty history", async () => {
-		settings.agent.modelCatalog = catalogWithWindow(model, 1);
+		withWindow(model, 1);
 		const controller = new AbortController();
 		controller.abort();
 		for (const entries of [[message], []]) {

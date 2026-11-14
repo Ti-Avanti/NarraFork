@@ -3,9 +3,11 @@ import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { MediaRef } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { modelInputText } from "../../../tests/fixtures/model-input";
-import { cleanDb } from "../../../tests/setup";
+import { wavBytes, webmBytes } from "../../../tests/fixtures/native-media";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -15,6 +17,8 @@ import {
 	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { saveUploadedMedia } from "../../lib/media-uploads";
+import { setUploadsDirForTests } from "../../lib/uploads";
 import { createAgentMessageDelivery } from "../agent-message-delivery";
 import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
 import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
@@ -230,9 +234,49 @@ function fixture(
 		owner,
 		session,
 		runControl,
-		run: (text = "same input") => runAgentLoopUnlocked(session, owner, text, undefined, runControl),
+		run: (text = "same input", media?: MediaRef[], prePromptBashCommand?: string) =>
+			runAgentLoopUnlocked(
+				session,
+				owner,
+				text,
+				undefined,
+				runControl,
+				prePromptBashCommand,
+				media,
+			),
 	};
 }
+
+describe("context overflow recovery cancellation", () => {
+	for (const profile of profiles) {
+		test(`${profile.kind}: abort during compact remains an interruption, not a compact failure`, async () => {
+			const service = await import("../narrator-service");
+			const session = await import("../narrator-session");
+			const h = fixture(profile, [
+				{
+					...finished,
+					finalText: "",
+					completedAssistantTurn: false,
+					completedNaturally: false,
+					contextLengthExceeded: true,
+				},
+			]);
+			spyOn(service.narratorService, "getCompactBoundaryMessage").mockResolvedValue("boundary");
+			const compact = spyOn(session, "runCustomCompact").mockImplementation(async () => {
+				h.session.abortController.abort();
+				return true;
+			});
+			const emitted: Array<{ type: string }> = [];
+			h.session.events.on("event", (event) => emitted.push(event));
+			const result = await h.run();
+			expect(result.aborted).toBe(true);
+			expect(result.hasError).toBe(false);
+			expect(h.calls).toHaveLength(1);
+			expect(compact).toHaveBeenCalledTimes(1);
+			expect(emitted.some((event) => event.type === "error")).toBe(false);
+		});
+	}
+});
 
 describe("round token totals at the Stop hook", () => {
 	for (const exit of ["normal", "workspace", "tool-limit", "throw"] as const) {
@@ -398,11 +442,18 @@ describe("tool Git status refresh", () => {
 });
 
 describe("outline task leases", () => {
-	test("a run keeps its session's leases alive from its start through its tool boundaries, and puts them on the idle lease at its end", async () => {
+	test("a run keeps its session's leases alive from its start through its tool boundaries, and settles its claims at its end", async () => {
 		const tasks = await import("../outline/tasks");
-		const { outlineLeaseKeepersOf } = await import("../outline/lease-keeper");
+		const release = await import("../outline/release");
+		const { outlineLeaseKeepersOf, outlineRunEndsSettled } = await import(
+			"../outline/lease-keeper"
+		);
 		const renew = spyOn(tasks, "renewOutlineTaskLeases").mockResolvedValue(0);
-		const idle = spyOn(tasks, "idleOutlineTaskClaims").mockResolvedValue(0);
+		const settled = spyOn(release, "settleOutlineTaskClaimsAtRunEnd").mockResolvedValue({
+			kept: 0,
+			grace: 0,
+			released: 0,
+		});
 		const enabled = settings.outline.enabled;
 		settings.outline.enabled = true;
 		let during = -1;
@@ -432,12 +483,403 @@ describe("outline task leases", () => {
 		expect(renew.mock.calls.every(([narratorId]) => narratorId === h.session.narratorId)).toBe(
 			true,
 		);
-		// The run's end (between turns, D41): once, for this session (not waited for by the run).
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		expect(idle).toHaveBeenCalledTimes(1);
-		expect(idle.mock.calls[0]?.[0]).toBe(h.session.narratorId);
+		// The run's end (between turns, D41; P2 PR 10c-2): once, for this session (not waited for by
+		// the run), told how the run ended and with the session's last reply.
+		await outlineRunEndsSettled(h.session.narratorId);
+		expect(settled).toHaveBeenCalledTimes(1);
+		expect(settled.mock.calls[0]?.[0]).toBe(h.session.narratorId);
+		// Nothing said who started it: a person's run, which gives nothing back at once.
+		expect(settled.mock.calls[0]?.[1]).toMatchObject({ natural: false, person: true });
 		renew.mockRestore();
-		idle.mockRestore();
+		settled.mockRestore();
+	});
+	/**
+	 * How the run's end is told to the release (outline P2 PR 10c-2): `natural` (only then are the
+	 * session's unfinished team tasks given back at once) and `person`, by who started the run and
+	 * how it ended. Each case runs the real loop and reads what `release.ts` was handed.
+	 */
+	describe("what the release is told of a run's end", () => {
+		type Script = Parameters<typeof fixture>[1];
+		async function endOf(
+			script: Script,
+			options: {
+				by?: "person" | "system";
+				text?: string;
+				forTaskId?: string;
+				during?: (h: ReturnType<typeof fixture>, run: Promise<unknown>) => Promise<void>;
+				profile?: Shape;
+			} = {},
+		) {
+			const release = await import("../outline/release");
+			const { outlineRunEndsSettled, resetOutlinePersonRunEndsForTests } = await import(
+				"../outline/lease-keeper"
+			);
+			resetOutlinePersonRunEndsForTests();
+			const settled = spyOn(release, "settleOutlineTaskClaimsAtRunEnd").mockResolvedValue({
+				kept: 0,
+				grace: 0,
+				released: 0,
+			});
+			const enabled = settings.outline.enabled;
+			settings.outline.enabled = true;
+			const h = fixture(options.profile ?? profiles[0], script);
+			// What the entry point says (`runAgentLoop`): taken by the run when it starts.
+			if (options.by) h.session._runInitiatedBy = options.by;
+			if (options.forTaskId) h.session._runForTaskId = options.forTaskId;
+			try {
+				const run = h.run(options.text ?? "");
+				if (options.during) await options.during(h, run);
+				await run;
+				await outlineRunEndsSettled(h.session.narratorId);
+				expect(settled).toHaveBeenCalledTimes(1);
+				expect(settled.mock.calls[0]?.[0]).toBe(h.session.narratorId);
+				// Taken, not left for the next run.
+				expect(h.session._runInitiatedBy).toBeUndefined();
+				expect(h.session._runForTaskId).toBeUndefined();
+				return settled.mock.calls[0]?.[1];
+			} finally {
+				settings.outline.enabled = enabled;
+				settled.mockRestore();
+			}
+		}
+
+		test("a person's message: not natural, a person's", async () => {
+			expect(await endOf([finished], { by: "person", text: "do this" })).toMatchObject({
+				natural: false,
+				person: true,
+			});
+		});
+
+		test("a subagent's run is never a person's hour of its own (its claims pass to its root)", async () => {
+			expect(
+				await endOf([finished], { by: "person", text: "do this", profile: profiles[1] }),
+			).toMatchObject({ person: false });
+		});
+
+		test("a person's Continue or Retry carries no text and is still a person's", async () => {
+			expect(await endOf([finished], { by: "person", text: "" })).toMatchObject({
+				natural: false,
+				person: true,
+			});
+		});
+
+		test("a system run that ends by itself: natural, with the task it was started for and its last reply", async () => {
+			expect(await endOf([finished], { by: "system", forTaskId: "task-1" })).toEqual({
+				natural: true,
+				person: false,
+				reply: "finished",
+				forTaskId: "task-1",
+				personHourUntil: null,
+			});
+		});
+
+		test("a system run with text (a wake that carries its content) is still the system's", async () => {
+			expect(await endOf([finished], { by: "system", text: "a notice" })).toMatchObject({
+				natural: true,
+				person: false,
+			});
+		});
+
+		test("a system run a person's queued message joined: a person's", async () => {
+			const end = await endOf([finished, finished], {
+				by: "system",
+				during: async (h) => {
+					setRunHold(h.session.narratorId, { released: false });
+					const deadline = Date.now() + 3_000;
+					while (!h.runControl.wake) {
+						if (Date.now() > deadline) throw new Error("Held run never parked");
+						await new Promise((resolve) => setTimeout(resolve, 2));
+					}
+					const { enqueueBufferedMessage } = await import("../narrator-buffer");
+					expect((await enqueueBufferedMessage(h.session.narratorId, "one more thing")).ok).toBe(
+						true,
+					);
+					setRunHold(h.session.narratorId, { released: true });
+					h.runControl.wake?.("input");
+				},
+			});
+			expect(end).toMatchObject({ natural: false, person: true });
+		});
+
+		test("a system run that was stopped: not natural", async () => {
+			let session: ActiveNarrator | undefined;
+			const end = await endOf(
+				[
+					async () => {
+						session?.abortController.abort();
+						return { ...finished, aborted: true, completedNaturally: false };
+					},
+				],
+				{
+					by: "system",
+					during: async (h) => {
+						session = h.session;
+					},
+				},
+			);
+			expect(end).toMatchObject({ natural: false, person: false });
+		});
+
+		test("a system run that failed: not natural", async () => {
+			const end = await endOf(
+				[
+					{
+						...finished,
+						completedNaturally: false,
+						paymentRequired: { message: "fixture balance exhausted", resumeAction: "retry" },
+					},
+				],
+				{ by: "system" },
+			);
+			expect(end).toMatchObject({ natural: false, person: false });
+		});
+
+		test("a system run that ends while something still works for the session in the background: not natural", async () => {
+			const { backgroundTaskService } = await import("../background-task-service");
+			const busy = spyOn(backgroundTaskService, "countActiveKindsByParent").mockResolvedValue({
+				activeCount: 1,
+				activeWorkCount: 1,
+				activeServiceCount: 0,
+			});
+			try {
+				expect(await endOf([finished], { by: "system" })).toMatchObject({
+					natural: false,
+					person: false,
+				});
+			} finally {
+				busy.mockRestore();
+			}
+		});
+
+		for (const kind of ["agent_message", "task_notice", "user_input"] as const)
+			test(`a system run that ends with a ${kind} waiting to start the next: not natural`, async () => {
+				const inbox = await import("../agent-runtime/inbox");
+				const real = inbox.hasInboxKind;
+				// Only the run end's own question (all three kinds) is answered here.
+				const waiting = spyOn(inbox, "hasInboxKind").mockImplementation(async (id, kinds) =>
+					kinds.length === 3 ? kinds.includes(kind) : real(id, kinds),
+				);
+				try {
+					expect(await endOf([finished], { by: "system" })).toMatchObject({
+						natural: false,
+						person: false,
+					});
+				} finally {
+					waiting.mockRestore();
+				}
+			});
+
+		test("a person acting inside a system run (a permission, a plan, a question resolved) makes it a person's", async () => {
+			let session: ActiveNarrator | undefined;
+			const end = await endOf(
+				[
+					async () => {
+						// What `resolvePermission` does when a person decides.
+						if (session) session._runPersonActed = true;
+						return finished;
+					},
+				],
+				{
+					by: "system",
+					during: async (h) => {
+						session = h.session;
+					},
+				},
+			);
+			expect(end).toMatchObject({ natural: false, person: true });
+		});
+
+		test("a system run that ends with a question a person has yet to answer: not natural", async () => {
+			const questions = await import("../narrator-question-service");
+			const open = spyOn(questions, "countOpenAsyncQuestions").mockResolvedValue(1);
+			try {
+				expect(await endOf([finished], { by: "system" })).toMatchObject({
+					natural: false,
+					person: false,
+				});
+			} finally {
+				open.mockRestore();
+			}
+		});
+
+		const noteCases: Array<[string, "person" | "system", boolean, () => Promise<() => void>]> = [
+			["the system's run that ends by itself", "system", true, async () => () => {}],
+			["a person's run", "person", false, async () => () => {}],
+			[
+				"the system's run with a question open",
+				"system",
+				false,
+				async () => {
+					const questions = await import("../narrator-question-service");
+					const open = spyOn(questions, "countOpenAsyncQuestions").mockResolvedValue(1);
+					return () => open.mockRestore();
+				},
+			],
+			[
+				"the system's run inside a person's hour",
+				"system",
+				false,
+				async () => {
+					const keeper = await import("../outline/lease-keeper");
+					const hour = spyOn(keeper, "outlinePersonHourRunning").mockReturnValue(true);
+					return () => hour.mockRestore();
+				},
+			],
+		];
+		for (const [name, by, expected, arrange] of noteCases)
+			test(`the turn-end note is told team tasks are given back only when they will be: ${name} → ${expected}`, async () => {
+				const session = await import("../narrator-session");
+				const note = spyOn(session, "decideOutlineTurnEndNote").mockResolvedValue(null);
+				const restore = await arrange();
+				try {
+					await endOf([finished], { by });
+					expect(note.mock.calls.at(-1)?.[1]?.givingBackTeamTasks).toBe(expected);
+				} finally {
+					restore();
+					note.mockRestore();
+				}
+			});
+
+		test("a person's decision on a permission marks the run of the session asking and of the one it shows on; an automatic one does not", async () => {
+			const { pendingPermissions } = await import("../narrator-session-state");
+			const { resolvePermission } = await import("../narrator-permission");
+			const asking = active("contract-person-asking");
+			const parent = active("contract-person-parent");
+			activeNarrators.set(asking.narratorId, asking);
+			activeNarrators.set(parent.narratorId, parent);
+			const pend = (requestId: string) =>
+				pendingPermissions.set(requestId, {
+					narratorId: asking.narratorId,
+					broadcastTargetId: parent.narratorId,
+					toolName: "Bash",
+					toolUseId: `${requestId}-use`,
+					input: {},
+					resolve: () => {},
+					cleanup: () => {},
+				} as never);
+			try {
+				pend("contract-person-auto");
+				await resolvePermission("contract-person-auto", "allow", { decidedBy: "auto" }).catch(
+					() => false,
+				);
+				expect(asking._runPersonActed).toBeUndefined();
+				expect(parent._runPersonActed).toBeUndefined();
+				pend("contract-person-user");
+				await resolvePermission("contract-person-user", "allow", { userId: "principal-a" }).catch(
+					() => false,
+				);
+				expect(asking._runPersonActed).toBe(true);
+				expect(parent._runPersonActed).toBe(true);
+			} finally {
+				pendingPermissions.delete("contract-person-auto");
+				pendingPermissions.delete("contract-person-user");
+				activeNarrators.delete(asking.narratorId);
+				activeNarrators.delete(parent.narratorId);
+			}
+		});
+
+		test("the next pass of a run that waited (`prepareQueuedRunInput`): a wake delivered is the system's, a person's queued message theirs", async () => {
+			const session = await import("../narrator-session");
+			const h = fixture(profiles[0], []);
+			// Read afresh each time (a set value would narrow the property's type).
+			const initiatedBy = (): string | undefined => h.session._runInitiatedBy;
+			// A pass before left its own word behind: the next pass never inherits it.
+			h.session._runInitiatedBy = "person";
+			h.session._runForTaskId = "task-1";
+			expect(await session.prepareQueuedRunInput(h.session, h.owner, h.runControl)).toBe(undefined);
+			expect(h.session._runInitiatedBy).toBeUndefined();
+			expect(h.session._runForTaskId).toBeUndefined();
+
+			const drain = spyOn(session, "drainAndPersistPendingInjections").mockResolvedValue(
+				"an agent's message",
+			);
+			try {
+				expect(await session.prepareQueuedRunInput(h.session, h.owner, h.runControl)).toEqual({
+					text: "",
+				});
+				expect(initiatedBy()).toBe("system");
+				// A person's answer among what was delivered (the drain marks it): the person's.
+				drain.mockImplementation(async (target) => {
+					target._runPersonActed = true;
+					return "a person's answer";
+				});
+				expect(await session.prepareQueuedRunInput(h.session, h.owner, h.runControl)).toEqual({
+					text: "",
+				});
+				expect(initiatedBy()).toBe("person");
+			} finally {
+				drain.mockRestore();
+			}
+
+			const { enqueueBufferedMessage } = await import("../narrator-buffer");
+			expect((await enqueueBufferedMessage(h.session.narratorId, "one more thing")).ok).toBe(true);
+			h.session._runInitiatedBy = "system";
+			const input = await session.prepareQueuedRunInput(h.session, h.owner, h.runControl);
+			expect(input?.text ?? "").toContain("one more thing");
+			expect(initiatedBy()).toBe("person");
+			h.session._runInitiatedBy = undefined;
+		});
+	});
+});
+
+describe("a session the Dynamic Spec import moved (outline P2 PR 12b2)", () => {
+	/** One run of the primary session; what its pass's config says about a spec:// call. */
+	async function onePass(moved: boolean) {
+		const { invalidateTaskBackend } = await import("../task-source/backend");
+		const { resetSpecImportStateCache, writeSpecImportState } = await import(
+			"../outline/spec-import/state"
+		);
+		const { getOutlineSpecRejection } = await import("../../lib/agent/tool-executor");
+		const enabled = settings.outline.enabled;
+		const mode = settings.outline.specImport;
+		settings.outline.enabled = true;
+		settings.outline.specImport = "manual";
+		db.update(narrators)
+			.set({ taskBackend: "outline" })
+			.where(eq(narrators.id, "contract-primary"))
+			.run();
+		invalidateTaskBackend();
+		resetSpecImportStateCache();
+		// Moved by the import (and told already).
+		if (moved)
+			await writeSpecImportState("contract-primary", {
+				status: "imported",
+				switchCount: 1,
+				noticeSwitch: 1,
+			});
+		const read = { toolUseId: "r1", name: "Read", input: { file_path: "spec://tasks.json" } };
+		const seen: Array<{ specImported?: boolean; output?: string }> = [];
+		try {
+			await fixture(profiles[0], [
+				async (options) => {
+					seen.push({
+						specImported: options.config.specImported,
+						output: getOutlineSpecRejection(read, options.config)?.output,
+					});
+					return { ...finished };
+				},
+			]).run();
+		} finally {
+			settings.outline.enabled = enabled;
+			settings.outline.specImport = mode;
+			invalidateTaskBackend();
+			resetSpecImportStateCache();
+		}
+		return seen;
+	}
+
+	test("the pass's config of a moved session carries it: a spec:// call is told where the files went", async () => {
+		const seen = await onePass(true);
+		expect(seen).toHaveLength(1);
+		expect(seen[0]?.specImported).toBe(true);
+		expect(seen[0]?.output).toContain("was moved into the outline");
+	});
+
+	test("a session created in the outline keeps the general hint", async () => {
+		const seen = await onePass(false);
+		expect(seen).toHaveLength(1);
+		expect(seen[0]?.specImported).toBe(false);
+		expect(seen[0]?.output).toContain("spec:// is not available in this session");
 	});
 });
 
@@ -516,7 +958,240 @@ describe("subagent signed source projection", () => {
 	});
 });
 
+describe("native media input transitions follow the unified run control", () => {
+	const refs: MediaRef[] = [
+		{
+			mediaId: "current-audio",
+			filename: "voice.wav",
+			mediaType: "audio/wav",
+			size: 60,
+			uploadNarratorId: "contract-parent",
+		},
+		{
+			mediaId: "current-video",
+			filename: "clip.webm",
+			mediaType: "video/webm",
+			size: 36,
+			uploadNarratorId: "contract-parent",
+		},
+	];
+	for (const rich of [false, true])
+		test(`queued /new consumes the real mailbox and strips command layout (document=${rich})`, async () => {
+			const { enqueueBufferedMessage, getBufferedMessages } = await import("../narrator-buffer");
+			const { resumeNextBufferedMessage } = await import("../narrator-session");
+			const source = active("contract-primary");
+			const directory = mkdtempSync(join(tmpdir(), "nf-queued-new-media-"));
+			setUploadsDirForTests(directory);
+			const media = await Promise.all([
+				saveUploadedMedia(
+					"contract-parent",
+					new File([new Uint8Array(wavBytes())], "voice.wav", { type: "audio/wav" }),
+				),
+				saveUploadedMedia(
+					"contract-parent",
+					new File([new Uint8Array(webmBytes([3, 4]))], "clip.webm", { type: "video/webm" }),
+				),
+			]);
+			const completed = Promise.withResolvers<string>();
+			const document = rich
+				? {
+						version: 1 as const,
+						paragraphs: [{ children: [{ type: "text" as const, text: "/new hello" }] }],
+						assets: [],
+					}
+				: undefined;
+			const queued = await enqueueBufferedMessage(
+				"contract-primary",
+				"/new hello",
+				undefined,
+				undefined,
+				"principal-a",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				document,
+				rich ? undefined : media,
+			);
+			expect(queued.ok).toBe(true);
+			spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				expect(options.config.narratorId).not.toBe("contract-primary");
+				expect(modelInputText(options)).toContain("hello");
+				expect(modelInputText(options)).not.toContain("/new hello");
+				if (!rich)
+					for (const ref of media) {
+						expect(JSON.stringify(options.history.rows)).toContain(ref.mediaId);
+						expect(JSON.stringify(options.history.rows)).toContain(ref.uploadNarratorId as string);
+					}
+				completed.resolve(options.config.narratorId as string);
+				return finished;
+			});
+			await resumeNextBufferedMessage(source, "en");
+			const id = await completed.promise;
+			await getRunControl(id)?.terminal;
+			expect(getBufferedMessages("contract-primary")).toHaveLength(0);
+			expect(getBufferedMessages(id)).toHaveLength(0);
+			activeNarrators.delete(id);
+			getExecutionOwner(id)?.release();
+			setUploadsDirForTests(null);
+			rmSync(directory, { recursive: true, force: true });
+		});
+	for (const transition of ["permission-feedback", "workspace-replay"] as const) {
+		test(`${transition}: committed input does not inherit current native refs`, async () => {
+			const { pendingFeedback } = await import("../narrator-session-state");
+			const nextText = `committed ${transition} input`;
+			const h = fixture(profiles[0], [
+				async (options) => {
+					expect(options.media).toEqual(refs);
+					if (transition === "permission-feedback")
+						pendingFeedback.set("contract-primary", {
+							toolUseId: "approved-tool",
+							feedbackText: nextText,
+							userId: "principal-a",
+						});
+					if (transition === "workspace-replay") h.session._workspacePassInvalidated = true;
+					return finished;
+				},
+				async (options) => {
+					expect(options.media).toBeUndefined();
+					if (transition !== "workspace-replay")
+						expect(modelInputText(options)).toContain(nextText);
+					return finished;
+				},
+			]);
+			expect((await h.run("unpersisted current input", refs)).hasError).toBe(false);
+			expect(h.calls).toHaveLength(2);
+		});
+	}
+	for (const profile of profiles)
+		test(`${profile.kind}: startNarratorRun forwards refs into its owned pass`, async () => {
+			const id = profile.kind === "primary" ? "contract-primary" : "contract-child";
+			const session = active(id);
+			activeNarrators.set(id, session);
+			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				expect(options.media).toEqual(refs);
+				expect(getExecutionOwner(id)).toBeDefined();
+				expect(getRunControl(id)).toBeDefined();
+				return finished;
+			});
+			const handle = await startNarratorRun({
+				narratorId: id,
+				locale: "en",
+				text: "unpersisted native input",
+				principal: "principal-a",
+				media: refs,
+				active: session,
+				deliver: false,
+			});
+			expect(handle.started).toBe(true);
+			expect((await handle.completion).hasError).toBe(false);
+			expect(execute).toHaveBeenCalledTimes(1);
+		});
+	for (const profile of profiles)
+		test(`${profile.kind}: pre-prompt Bash clears separate media without changing run ownership`, async () => {
+			const service = await import("../narrator-service");
+			const bash = spyOn(service, "handleBashCommand").mockResolvedValue({
+				type: "bash",
+				id: "native-media-bash",
+				output: "committed Bash result",
+				isError: false,
+			});
+			const h = fixture(profile, [
+				async (options) => {
+					expect(bash).toHaveBeenCalledTimes(1);
+					expect(options.media).toBeUndefined();
+					expect(getRunControl(h.session.narratorId)).toBe(h.runControl);
+					return finished;
+				},
+			]);
+			expect((await h.run("unpersisted current input", refs, "printf done")).hasError).toBe(false);
+			expect(h.calls).toHaveLength(1);
+		});
+});
+
 describe("real shared orchestrator profile contract", () => {
+	for (const cap of [0, 256]) {
+		test(`user-message knowledge respects the shared evidence allowance (${cap} bytes)`, async () => {
+			const { knowledgeInjection } = await import("../knowledge-injection");
+			const oldBudget = settings.agent.contextEvidenceBudgetBytes;
+			settings.agent.contextEvidenceBudgetBytes = cap;
+			const resolve = spyOn(knowledgeInjection, "resolveInjections").mockResolvedValue([
+				{ entryId: "too-large", title: "OVER_BUDGET_KNOWLEDGE", summary: "摘要".repeat(256) },
+			]);
+			let checked = false;
+			spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				expect(options.config.evidenceBudget?.remaining).toBe(cap);
+				expect(JSON.stringify(options.history)).not.toContain("OVER_BUDGET_KNOWLEDGE");
+				const budget = options.config.evidenceBudget;
+				budget?.reserve("knowledge", cap).commit("x".repeat(cap));
+				await options.config.rebuildRequestHistory?.();
+				expect(options.config.evidenceBudget).toBe(budget);
+				expect(budget?.remaining).toBe(cap);
+				checked = true;
+				return finished;
+			});
+			try {
+				const handle = await startNarratorRun({
+					narratorId: "contract-primary",
+					locale: "en",
+					text: "knowledge budget",
+					principal: "principal-a",
+					deliver: false,
+				});
+				expect((await handle.terminal).hasError).toBe(false);
+				expect(checked).toBe(true);
+				if (cap === 0) expect(resolve).not.toHaveBeenCalled();
+				else expect(resolve.mock.calls[0]?.[2]?.byteBudget).toBeLessThanOrEqual(cap);
+				expect(
+					db
+						.select()
+						.from(narratorMessages)
+						.all()
+						.some((message) => message.contentText?.includes("OVER_BUDGET_KNOWLEDGE")),
+				).toBe(false);
+			} finally {
+				settings.agent.contextEvidenceBudgetBytes = oldBudget;
+			}
+		});
+	}
+
+	test("the real run recalls the acting user's memory and rechecks it before the next request", async () => {
+		const { contextMemoryService } = await import("../context-memory-service");
+		const actor = { userId: "principal-a", isAdmin: false, kind: "user" as const };
+		db.update(narrators)
+			.set({ ownerUserId: actor.userId, visibility: "private", writeAudience: "owner" })
+			.where(eq(narrators.id, "contract-primary"))
+			.run();
+		const memory = await contextMemoryService.propose(
+			{ scope: { kind: "user" }, key: "tests", content: "PRIVATE_RUNTIME_MEMORY" },
+			actor,
+		);
+		await contextMemoryService.decide(memory.id, { action: "confirm", expectedVersion: 1 }, actor);
+		const prompts: string[] = [];
+		const pass = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+			prompts.push(options.config.systemPrompt ?? "");
+			await contextMemoryService.forget(memory.id, 2, actor);
+			const next = await options.config.rebuildRequestHistory?.();
+			prompts.push(next?.systemPrompt ?? "");
+			return finished;
+		});
+		const handle = await startNarratorRun({
+			narratorId: "contract-primary",
+			locale: "en",
+			text: "remember tests",
+			principal: actor.userId,
+			deliver: false,
+		});
+		expect((await handle.terminal).hasError).toBe(false);
+		expect(pass).toHaveBeenCalledTimes(1);
+		expect(prompts[0]).toContain("PRIVATE_RUNTIME_MEMORY");
+		expect(prompts[1]).not.toContain("PRIVATE_RUNTIME_MEMORY");
+	});
+
 	for (const kind of ["references", "bash", "official-references"] as const) {
 		test(`primary: spilled ${kind} survive materialization and start the next pass`, async () => {
 			const oldHome = process.env.NARRAFORK_HOME;
@@ -863,7 +1538,8 @@ describe("real shared orchestrator profile contract", () => {
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, h.session.narratorId))
 				.all();
-			expect(rows.find((row) => row.contentText?.startsWith("[Error]"))?.contentJson).toEqual([
+			const error = rows.find((row) => row.contentText?.startsWith("[Error]"));
+			expect(readTestMessageContent(sqlite, error?.id ?? "")).toEqual([
 				{ type: "error", message: "fixture exhausted provider retries", diagnostics },
 			]);
 		});
@@ -891,7 +1567,8 @@ describe("real shared orchestrator profile contract", () => {
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, h.session.narratorId))
 				.all();
-			expect(rows.find((row) => row.contentText?.startsWith("[Error]"))?.contentJson).toEqual([
+			const error = rows.find((row) => row.contentText?.startsWith("[Error]"));
+			expect(readTestMessageContent(sqlite, error?.id ?? "")).toEqual([
 				{
 					type: "error",
 					message: "upstream failure 3",
@@ -1291,6 +1968,32 @@ describe("real shared orchestrator profile contract", () => {
 		expect(JSON.stringify(stream[1][1])).not.toContain("subagentToolUseId");
 	});
 
+	test("primary stops unchanged tool-evidence continuations without completing its task", async () => {
+		const { writeSpecFile, readSpecFile } = await import("../spec-vfs-service");
+		await db
+			.update(narrators)
+			.set({ autoContinuationOverride: "always" })
+			.where(eq(narrators.id, "contract-primary"));
+		await writeSpecFile(
+			"contract-primary",
+			"spec://tasks.json",
+			JSON.stringify({ tasks: [{ text: "finite evidence fixture", status: "doing" }] }),
+		);
+		const h = fixture(
+			profiles[0],
+			Array.from({ length: 5 }, () => ({
+				...finished,
+				hadToolUses: true,
+				toolProgressFingerprint: "same-settled-evidence",
+			})),
+		);
+		expect((await h.run()).hasError).toBe(false);
+		expect(h.calls).toHaveLength(5);
+		expect((await readSpecFile("contract-primary", "spec://tasks.json"))?.content).toContain(
+			'"doing"',
+		);
+	});
+
 	test("child doing Spec work exhausts the real per-run continuation budget without changing task status", async () => {
 		const { writeSpecFile, readSpecFile } = await import("../spec-vfs-service");
 		const { resolveNarratorRuntimePolicy } = await import("../trait-layer-service");
@@ -1537,6 +2240,8 @@ describe("real shared orchestrator profile contract", () => {
 for (const profile of profiles) {
 	test(`${profile.kind}: real keyword knowledge hit has the same system sender live and in history`, async () => {
 		const { knowledgeService } = await import("../knowledge-service");
+		const { knowledgeInjection } = await import("../knowledge-injection");
+		const knowledgeScan = spyOn(knowledgeInjection, "resolveInjections");
 		const { narratorPersistence } = await import("../narrator-persistence");
 		const { buildRuntimeHistory } = await import("../agent-runtime/history");
 		const { projectMessageSenderText } = await import("../../lib/agent/sender-projection");
@@ -1588,6 +2293,8 @@ for (const profile of profiles) {
 			expect(input).toContain(projected);
 			expect(input.match(/<sender kind="system"/g)).toHaveLength(1);
 			expect(knowledge.contentText).not.toContain("<sender ");
+			expect(knowledgeScan).toHaveBeenCalled();
+			expect(knowledgeScan.mock.calls[0]?.[2]?.signal).toBe(h.session.abortController.signal);
 			const rebuilt = await buildRuntimeHistory({
 				narratorId: h.session.narratorId,
 				model: MODEL,

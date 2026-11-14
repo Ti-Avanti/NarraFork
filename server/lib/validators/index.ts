@@ -7,6 +7,9 @@ export {
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
 	createGitIdentitySchema,
+	type LdapSettingsInput,
+	ldapConnectionTestSchema,
+	ldapSettingsInputSchema,
 	loginSchema,
 	mfaToggleSchema,
 	mfaVerifySchema,
@@ -18,6 +21,7 @@ export {
 	passkeyRegisterSchema,
 	passkeyRenameSchema,
 	registerSchema,
+	stepUpSchema,
 	totpActivateSchema,
 	totpDisableSchema,
 	updateGitIdentitySchema,
@@ -97,6 +101,7 @@ export {
 	listKnowledgeEntriesQuerySchema,
 	listKnowledgeLinksQuerySchema,
 	listPersonalEntriesQuerySchema,
+	markSubmissionOutcomesReadSchema,
 	rebaseKnowledgeDraftQuerySchema,
 	resolveKnowledgeConflictSchema,
 	resubmitKnowledgeSubmissionSchema,
@@ -120,6 +125,10 @@ export {
 	listKnowledgePacksQuerySchema,
 	updateKnowledgePackSchema,
 } from "./knowledge-packs";
+export {
+	narratorTimelineQuerySchema,
+	narratorTimelineTurnsQuerySchema,
+} from "./narrator-timeline";
 export {
 	askInPassingSchema,
 	askInPassingStartSchema,
@@ -150,6 +159,7 @@ export {
 	humanAttentionListQuerySchema,
 	migrateBrokenModelNarratorsSchema,
 	narratorExportQuerySchema,
+	narratorExportTurnsQuerySchema,
 	narratorGrantCreateSchema,
 	narratorGrantUpdateSchema,
 	narratorHandleSchema,
@@ -213,6 +223,7 @@ export {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
 	createFavoriteDirectorySchema,
+	createRecentTabFolderSchema,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
 	recentTabSchema,
@@ -221,9 +232,9 @@ export {
 	removeRecentTabSchema,
 	reorderFavoriteDirectoriesSchema,
 	restoreRecentTabsSchema,
-	setRecentTabDirectoryOrderSchema,
 	specTabLayoutPatchSchema,
 	updateFavoriteDirectorySchema,
+	updateRecentTabFolderSchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "./settings";

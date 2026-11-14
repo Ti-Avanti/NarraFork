@@ -1,6 +1,6 @@
 /**
- * RenderMedia.tsx — Render copies for the three media blocks measured by
- * measure-media.ts (image / text_file / image_generation). Draws each
+ * RenderMedia.tsx — Render copies for the media blocks measured by
+ * measure-media.ts (image / audio / video / text_file / image_generation). Draws each
  * MeasuredElement at the exact geometry the measure layer computed, using
  * absolute positioning — no reflow, no DOM measurement (the image-unknown
  * placeholder keeps the reserved height; the owning integration layer may do a
@@ -16,9 +16,13 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
+import { isRemoteInlineImage } from "@frontend/lib/remote-resource-policy";
 import { Divider } from "@mantine/core";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { Fragment, useMemo } from "react";
+import { MediaAttachment } from "../../message/MediaAttachment";
+import type { ContentBlock } from "../../narrator-panel-types";
 import {
 	IMGGEN_GROUP_GAP,
 	IMGGEN_ICON_SIZE,
@@ -100,6 +104,24 @@ export function RenderMedia({
 
 	// image / text_file: a single fixed block.
 	if (first?.kind === "fixed") {
+		if (first.tag === "audio" || first.tag === "video") {
+			return (
+				<div style={{ position: "relative", height: frame.contentHeight }}>
+					<div
+						style={{
+							position: "absolute",
+							top: frame.blocks[0]?.top ?? 0,
+							left: 0,
+							height: first.height,
+							width: first.displayWidth,
+							maxWidth: "100%",
+						}}
+					>
+						<MediaAttachment narratorId={narratorId ?? ""} block={first.data as ContentBlock} />
+					</div>
+				</div>
+			);
+		}
 		if (first.tag === "image") {
 			return (
 				<div style={{ position: "relative", height: frame.contentHeight }}>
@@ -138,7 +160,9 @@ function ImageFixedView({
 	const data = block.data ?? {};
 	// A caller-provided resolver wins (test/injection); otherwise VListImage
 	// resolves the src itself (previewUrl → uploads blob by id + narratorId).
-	const injected = resolveImageSrc?.(block.tag, data) ?? null;
+	const candidate = resolveImageSrc?.(block.tag, data) ?? null;
+	const injected =
+		candidate && (!REMOTE_BUILD || isRemoteInlineImage(candidate)) ? candidate : null;
 	const filename = typeof data.filename === "string" ? data.filename : "image";
 	// When the measure layer had intrinsic dimensions it reserved the aspect-
 	// fitted box and stashed the exact display geometry here; the paint must
@@ -219,7 +243,7 @@ function TextFileView({ block, frame }: { block: PreparedFixedBlock; frame: Bloc
 function RenderImageGeneration({
 	measured,
 	resolveImageSrc,
-	generating,
+	generating: legacyGenerating,
 	narratorId,
 }: {
 	measured: MeasuredElement;
@@ -228,7 +252,14 @@ function RenderImageGeneration({
 	narratorId?: string;
 }) {
 	const { blocks, frame, contentWidth } = measured;
-	const { inRun, isLast } = measured as Partial<MeasuredImageGeneration>;
+	const {
+		inRun,
+		isLast,
+		generating: measuredGenerating,
+	} = measured as Partial<MeasuredImageGeneration>;
+	// Use the measure layer's activity state, so stale generic render extras cannot
+	// keep a failed/cancelled card spinning or shift its header geometry.
+	const generating = measuredGenerating ?? legacyGenerating;
 	const header = blocks[0] as PreparedInlineBlock;
 	const headerFrame = frame.blocks[0]!;
 	const imageBlock = blocks[1];
@@ -403,7 +434,9 @@ function ImageAreaView({
 	const data = (block.kind === "fixed" || block.kind === "unknown" ? block.data : undefined) ?? {};
 	// Caller-provided resolver wins; otherwise VListImage resolves it (data-url
 	// result / previewUrl / uploads blob).
-	const injected = resolveImageSrc?.(tag, data) ?? null;
+	const candidate = resolveImageSrc?.(tag, data) ?? null;
+	const injected =
+		candidate && (!REMOTE_BUILD || isRemoteInlineImage(candidate)) ? candidate : null;
 
 	return (
 		<div

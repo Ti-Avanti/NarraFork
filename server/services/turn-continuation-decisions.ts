@@ -42,7 +42,7 @@ export type TurnInterruptionPlan =
 			action: "prompt";
 			retries: number;
 			reason: NonNullable<ExecuteLoopResult["interruptedReason"]>;
-			promptKey: "interruptionContinue" | "resumeAfterTransientError";
+			promptKey: "interruptionContinue" | "resumeAfterTransientError" | "thinkingExhaustedContinue";
 	  };
 
 /**
@@ -54,6 +54,13 @@ export type TurnInterruptionPlan =
  * produced). Defaulting the reason to `completion_limit` matches the flag's own
  * documented default for callers that only ever checked `interrupted`.
  *
+ * A completion limit with NOTHING visible to resume (no text, no tool call) is its own
+ * case: the whole output budget went into internal reasoning. "Continue from where you
+ * left off" is meaningless there — there is no interruption point, and re-sending it just
+ * lets the model spend another full output budget thinking. It gets one targeted nudge
+ * ("answer directly, do not keep reasoning") and a second identical outcome stops the
+ * turn instead of burning another pass.
+ *
  * `suppressed` folds together the two ways a caller declines to continue at all — the
  * primary loop's `!active.alive` and the subagent's `signal.aborted`. Both mean the same
  * thing here: something else owns the run's ending, so reset the counter and let the
@@ -63,7 +70,11 @@ export type TurnInterruptionPlan =
 export function planTurnInterruption(
 	result: Pick<
 		ExecuteLoopResult,
-		"interrupted" | "interruptedReason" | "shouldReplayInterruptedToolResultTurn"
+		| "interrupted"
+		| "interruptedReason"
+		| "shouldReplayInterruptedToolResultTurn"
+		| "hadToolUses"
+		| "finalText"
 	>,
 	previousRetries: number,
 	options?: { suppressed?: boolean; maxRetries?: number },
@@ -72,6 +83,15 @@ export function planTurnInterruption(
 	const maxRetries = options?.maxRetries ?? MAX_TURN_INTERRUPTION_RETRIES;
 	const reason = result.interruptedReason ?? "completion_limit";
 	const retries = previousRetries + 1;
+	const thinkingOnly =
+		reason === "completion_limit" &&
+		result.hadToolUses === false &&
+		result.finalText !== undefined &&
+		!result.finalText.trim();
+	if (thinkingOnly) {
+		if (previousRetries >= 1) return { action: "stop", retries, reason };
+		return { action: "prompt", retries, reason, promptKey: "thinkingExhaustedContinue" };
+	}
 	if (retries > maxRetries) return { action: "stop", retries, reason };
 	if (result.shouldReplayInterruptedToolResultTurn) return { action: "replay", retries, reason };
 	return {
@@ -82,15 +102,7 @@ export function planTurnInterruption(
 	};
 }
 
-/**
- * How many consecutive no-progress self-continuations are allowed before the loop
- * stops nudging itself.
- *
- * "No progress" is deliberately narrow (see {@link computeContinuationStallState}):
- * a pass that ran a tool resets the count, so this bound only bites on a model that
- * answers the reminder with prose, or that keeps attempting the same rejected
- * protected-task mutation.
- */
+/** Maximum unchanged automatic-continuation observations before stopping. */
 export const MAX_CONTINUATION_STALL_TURNS = 3;
 
 export interface ContinuationStallState {
@@ -100,45 +112,36 @@ export interface ContinuationStallState {
 }
 
 /**
- * Classify whether a finished continuation pass made progress, and whether further
- * self-continuation must stop.
+ * A pure bound shared by primary and delegated continuation. Prose-only passes and
+ * repeated reflection denials retain their existing limits. Complete tool receipts
+ * establish an evidence baseline; identical later observations are not new progress
+ * merely because the provider minted fresh tool-use ids. Missing or oversized
+ * evidence is unknown and preserves the legacy tool-progress behavior.
  *
- * ## Why this is the ONLY bound on spec/max-turns continuation
- *
- * Each continuation pass gets a fresh turn budget, so nothing about turn counts can
- * bound a loop that re-continues after exhausting one. What bounds it is progress:
- * either the model called a tool (real work happened, so continuing is justified) or
- * it did not (the reminder produced nothing, so repeating it will keep producing
- * nothing). A repeated identical `taskReflection` denial is the same story with a
- * different signature: the model keeps trying one rejected protected-task mutation.
- *
- * ## Purity is load-bearing
- *
- * The function reads nothing but its arguments — in particular NOT the caller's state
- * container. The primary loop stores the counters on its `ActiveNarrator`; a subagent
- * has no such object and keeps them in run-local variables, which is a tighter scope
- * (its run IS the bound's natural lifetime) and works only because the rule itself
- * holds no state. Both audiences therefore share one bound rather than each inventing
- * one.
- *
- * `previous` is the caller's last returned state. A different key restarts the count,
- * which is what makes "a new kind of stall" distinguishable from "the same stall
- * again".
+ * Only granted continuation passes are judged. Fresh human input resets the state;
+ * this function neither changes task status nor authorizes tool replay.
  */
 export function computeContinuationStallState(
 	kind: "task" | "blocked",
-	result: Pick<ExecuteLoopResult, "hadToolUses" | "taskReflectionDenialFingerprint">,
+	result: Pick<
+		ExecuteLoopResult,
+		"hadToolUses" | "taskReflectionDenialFingerprint" | "toolProgressFingerprint"
+	>,
 	previous: Pick<ContinuationStallState, "count" | "key">,
 ): ContinuationStallState {
 	const denialFingerprint = result.taskReflectionDenialFingerprint?.trim();
 	const stallKey = denialFingerprint
 		? `task-reflection:${denialFingerprint}`
 		: result.hadToolUses
-			? undefined
+			? result.toolProgressFingerprint
+				? `tool-evidence:${result.toolProgressFingerprint}`
+				: undefined
 			: `no-tools:${kind}`;
 	if (!stallKey) return { count: 0, key: undefined, suppressed: false };
 
-	const count = previous.key === stallKey ? previous.count + 1 : 1;
+	// The first complete observation is a baseline, not a stalled attempt.
+	const count =
+		previous.key === stallKey ? previous.count + 1 : stallKey.startsWith("tool-evidence:") ? 0 : 1;
 	const limit = kind === "blocked" ? 1 : MAX_CONTINUATION_STALL_TURNS;
 	return { count, key: stallKey, suppressed: count >= limit };
 }
@@ -175,6 +178,11 @@ export interface SpecContinuationState {
 	grantedKind?: "task" | "blocked";
 	/** The last declined grant, available for result-delivery explanations. */
 	stop?: Extract<SpecContinuationPlan, { action: "stop" }>;
+	/**
+	 * The run has no tasks of its own and continues on its turn budget only (an outline subagent,
+	 * D27c): set with each decision, so the stop note does not speak of tasks it never had.
+	 */
+	turnBudgetOnly?: boolean;
 }
 
 export function createSpecContinuationState(): SpecContinuationState {
@@ -235,7 +243,10 @@ export function planSpecContinuation(input: {
 	protectedOpenCount: number;
 	previous: SpecContinuationState;
 	/** Omit when the ordinary loop already classified this pass into previous.stall. */
-	result?: Pick<ExecuteLoopResult, "hadToolUses" | "taskReflectionDenialFingerprint">;
+	result?: Pick<
+		ExecuteLoopResult,
+		"hadToolUses" | "taskReflectionDenialFingerprint" | "toolProgressFingerprint"
+	>;
 	/** Policy ceiling; omitted/null preserves ordinary unlimited progress continuation. */
 	maxPasses?: number | null;
 	/** An explicit /goal starts once even when automatic continuation is off. */
@@ -358,8 +369,20 @@ export function buildSpecContinuationPrompt(input: {
 export function specContinuationStopNote(
 	plan: Extract<SpecContinuationPlan, { action: "stop" }>,
 	locale: Locale,
+	options: { turnBudgetOnly?: boolean } = {},
 ): string {
 	const isZh = locale === "zh-CN";
+	if (options.turnBudgetOnly) {
+		// No task list of its own (an outline subagent): what ran out is the turn budget.
+		if (plan.reason === "stalled") {
+			return isZh
+				? "[自动续跑已停止：连续续跑未产生实际进展（未调用任何工具）。本次运行在给出最终回复之前结束。]"
+				: "[Auto-continuation stopped: the extra passes produced no effective progress (no tool calls). The run ended before giving a final reply.]";
+		}
+		return isZh
+			? `[自动续跑已停止：本次运行已达到续跑预算（已续跑 ${plan.passes} 次），尚未给出最终回复，如需继续请重新派发。]`
+			: `[Auto-continuation stopped: this run reached its continuation budget after ${plan.passes} continuation passes, before giving a final reply; dispatch again to continue.]`;
+	}
 	if (plan.reason === "stalled") {
 		return isZh
 			? "[自动续跑已停止：连续续跑未产生实际进展（未调用任何工具，或反复触发同一次 protected 任务驳回）。spec://tasks.json 中仍有未完成条目。]"

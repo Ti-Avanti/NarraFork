@@ -9,7 +9,13 @@ import {
 	startCompactAttempt,
 	truncateCompactError,
 } from "@shared/compact-message";
+import {
+	type ContextWorkState,
+	parseContextWorkState,
+	renderContextWorkState,
+} from "@shared/context-work-state";
 import type { MessageOriginOptions } from "@shared/message-origin";
+import { isHistoryProtectedContent } from "@shared/narrator-blocks/retention";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
 import { and, desc, eq, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
@@ -62,6 +68,7 @@ import { getExecutionOwner, preserveHeldSubstatus } from "./agent-runtime/owners
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import {
+	CLEARED_TOOL_OUTPUT_SQL,
 	contentByAttempt,
 	flushQueuedSince,
 	newEnvelopeColumns,
@@ -524,6 +531,26 @@ export function cowEnvelopeTx(
 	},
 ): string {
 	const { original, ref } = input;
+	if (
+		isHistoryProtectedContent(original.contentJson) &&
+		input.changes?.editedAt &&
+		Array.isArray(input.changes.contentJson) &&
+		input.changes.contentJson[0]
+	) {
+		const {
+			historyClearVersion: _version,
+			historyClearedAt: _at,
+			...first
+		} = input.changes.contentJson[0];
+		input.changes = {
+			...input.changes,
+			originalContentJson: null,
+			contentJson: [
+				{ historyToolsSuppressed: true, ...first },
+				...input.changes.contentJson.slice(1),
+			],
+		};
+	}
 	const id = generateId();
 	const now = new Date().toISOString();
 	const copy = {
@@ -894,6 +921,12 @@ function overwriteToolInputTx(
 	toolUseId: string,
 	input: Record<string, unknown>,
 ): Record<string, unknown> {
+	if (
+		sqlite
+			.query(`SELECT 1 FROM narrator_tool_calls WHERE id = ? AND ${CLEARED_TOOL_OUTPUT_SQL}`)
+			.get(toolCallId)
+	)
+		return {};
 	const existing = tx
 		.select({
 			messageId: narratorToolCalls.messageId,
@@ -1332,33 +1365,42 @@ async function appendPersistedMessage(
 	}
 	const created = await withDbRetry(
 		async () =>
-			db.transaction((tx) => {
-				const queueMark = syncQueueMark();
-				let seq = 0;
-				// The blocks commit with the envelope and the rows that belong to it.
-				const created = insertEnvelope(
-					tx,
-					{
-						...newEnvelopeColumns(message.narratorId),
-						...message,
-						authorNarratorId: message.authorNarratorId ?? message.narratorId,
-					},
-					{
-						mode: options?.blockMode,
-						rows: () => {
-							seq = appendMessageRefSync(tx, message.narratorId, message.id, 0, bumpMessageVersion);
-							options?.withRows?.(tx);
-							if (options?.enabledTools)
-								tx.update(narrators)
-									.set({ enabledTools: options.enabledTools })
-									.where(eq(narrators.id, message.narratorId))
-									.run();
+			db.transaction(
+				(tx) => {
+					const queueMark = syncQueueMark();
+					let seq = 0;
+					// The blocks commit with the envelope and the rows that belong to it.
+					const created = insertEnvelope(
+						tx,
+						{
+							...newEnvelopeColumns(message.narratorId),
+							...message,
+							authorNarratorId: message.authorNarratorId ?? message.narratorId,
 						},
-					},
-				);
-				flushQueuedSince(queueMark);
-				return { ...created, seq };
-			}),
+						{
+							mode: options?.blockMode,
+							rows: () => {
+								seq = appendMessageRefSync(
+									tx,
+									message.narratorId,
+									message.id,
+									0,
+									bumpMessageVersion,
+								);
+								options?.withRows?.(tx);
+								if (options?.enabledTools)
+									tx.update(narrators)
+										.set({ enabledTools: options.enabledTools })
+										.where(eq(narrators.id, message.narratorId))
+										.run();
+							},
+						},
+					);
+					flushQueuedSince(queueMark);
+					return { ...created, seq };
+				},
+				{ behavior: "immediate" },
+			),
 		{ label: "appendPersistedMessage", maxRetries: 5 },
 	);
 	if (message.role !== "disp") queueContextCharacterRefresh(message.narratorId, message.id);
@@ -1742,6 +1784,8 @@ const sqliteNarratorPersistence = {
 			text: string;
 			definitionSnapshots?: import("../lib/agent/tool-loading").ToolDefinitionSnapshot[];
 			definitionSnapshotRef?: string;
+			/** The epoch's strategy could not append this load; the next request rebaselines. */
+			rebaseline?: true;
 		},
 		/** `system` for a change the runtime reconciled rather than a `/load` someone typed. */
 		origin?: "system",
@@ -1897,6 +1941,69 @@ const sqliteNarratorPersistence = {
 				}),
 			{ label: "persistCompactingMessage", maxRetries: 5 },
 		);
+	},
+
+	/**
+	 * Record the context-window occupancy a compact marker actually changed.
+	 *
+	 * `before` is the narrator's own history footprint when the compact started and
+	 * `after` the footprint once the summary was committed. Both are display metadata
+	 * only — they never feed the agent loop — so a declined write costs a label, not a
+	 * compact. The summary model's own request occupancy is a different number (a
+	 * different model's window) and must never be stored here.
+	 */
+	async setCompactContextPercent(
+		narratorId: string,
+		messageId: string,
+		patch: { before?: number | null; after?: number | null },
+	) {
+		const before =
+			typeof patch.before === "number" && Number.isFinite(patch.before) ? patch.before : undefined;
+		const after =
+			typeof patch.after === "number" && Number.isFinite(patch.after) ? patch.after : undefined;
+		if (before == null && after == null) return null;
+		return db.transaction((tx) => {
+			const msg = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						...bodyColumns({ id: true, contentJson: true }),
+						where: and(
+							eq(narratorMessages.id, messageId),
+							eq(narratorMessages.narratorId, narratorId),
+							eq(narratorMessages.role, "system"),
+						),
+					})
+					.sync(),
+			);
+			if (!msg) return null;
+			const ref = tx.query.narratorMessageRefs
+				.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+					columns: { seq: true },
+				})
+				.sync();
+			if (!ref) return null;
+
+			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const index = blocks.findIndex((block) => parseCompactMessageBlock(block) != null);
+			if (index < 0) return null;
+			const nextBlocks = [...blocks];
+			nextBlocks[index] = {
+				...(blocks[index] as Record<string, unknown>),
+				...(before != null ? { contextPercentBefore: before } : {}),
+				...(after != null ? { contextPercentAfter: after } : {}),
+			};
+			const written = writeEnvelopeBody(tx, messageId, nextBlocks, {
+				set: { contextCharsJson: measureMessageCharacters("system", nextBlocks) },
+				where: eq(narratorMessages.narratorId, narratorId),
+			});
+			if (!written) return null;
+			const updated = readEnvelope(tx, messageId);
+			return updated ? { ...updated, seq: ref.seq } : null;
+		});
 	},
 
 	async prepareFailedCompactRetry(narratorId: string, messageId: string, model?: string) {
@@ -2141,12 +2248,26 @@ const sqliteNarratorPersistence = {
 			expectedCompactBoundaryMessageId?: string | null;
 			expectedAttempt?: number;
 			expectedSeq?: number;
+			/** Host observations only; never used to restore execution authority. */
+			workState?: ContextWorkState;
+			workStateLocale?: string;
 			/** What the epoch this compact opens froze (§7.7); recorded on success. */
 			epoch?: EpochRecord;
 		},
 	) {
 		const now = new Date().toISOString();
 		const status = options?.status ?? "compacted";
+		const workState =
+			options?.workState === undefined ? null : parseContextWorkState(options.workState);
+		if (status === "compacted") {
+			if (!summary.trim())
+				throw new ValidationError("Cannot finalize compact with an empty summary");
+			if (options?.workState !== undefined && (!workState || workState.narratorId !== narratorId)) {
+				throw new ValidationError("Invalid or mismatched context work-state snapshot");
+			}
+			if (workState)
+				summary = `${summary}\n\n${renderContextWorkState(workState, options?.workStateLocale ?? "en")}`;
+		}
 
 		return db.transaction((tx) => {
 			// The ref is the authorization and ownership boundary. The message row may
@@ -2221,8 +2342,14 @@ const sqliteNarratorPersistence = {
 			);
 			const compactBlock = {
 				...finished,
-				...(status === "compacted" ? { summary, contextPercentAfter: contextPercent } : {}),
+				// `contextPercent` is what the summary model's own request occupied on ITS
+				// window — not what this compact left in the narrator's. The real `after` is
+				// estimated from the rebuilt history once the summary is committed and is
+				// written back through `setCompactContextPercent`; storing the summary model's
+				// number here would publish a percentage of the wrong window.
+				...(status === "compacted" ? { summary } : {}),
 				...(status === "compacted" && options?.epoch ? { epoch: options.epoch } : {}),
+				...(status === "compacted" && workState ? { workState } : {}),
 			};
 			const failureText = truncateCompactError(options?.error ?? "Compact failed");
 			const contentText =
@@ -2511,10 +2638,16 @@ const sqliteNarratorPersistence = {
 			| {
 					type: "image_generation";
 					id: string;
+					status?: string;
+					error?: string;
+					errorCode?: string;
 					revisedPrompt?: string;
 					outputIndex?: number;
 					savedPath?: string;
 					result?: string;
+					partialSavedPath?: string;
+					partialImageIndex?: number;
+					partialImageB64?: string;
 					width?: number;
 					height?: number;
 			  },
@@ -2534,150 +2667,175 @@ const sqliteNarratorPersistence = {
 		let toolCallId: string | undefined;
 		// No await between reading and replacing the JSON body: a concurrent checkpoint
 		// or translation must not overwrite a newer revision read by another consumer.
-		const persisted = db.transaction((tx) => {
-			const queueMark = syncQueueMark();
-			const existing = fillBody(
-				tx.query.narratorMessages
-					.findFirst({
-						where: eq(narratorMessages.id, messageId),
-						...bodyColumns({ id: true, contentJson: true, parentToolUseId: true }),
-					})
-					.sync(),
-			);
-			if (!existing) throw new NotFoundError("Assistant message", messageId);
+		// A transient BUSY here aborts the whole assistant-content checkpoint, and the
+		// loop treats that as a critical persistence failure. Other writers in this file
+		// already retry the same way; this path must not be the one that gives up first.
+		const persisted = await withDbRetry(
+			async () =>
+				db.transaction(
+					(tx) => {
+						const queueMark = syncQueueMark();
+						const existing = fillBody(
+							tx.query.narratorMessages
+								.findFirst({
+									where: eq(narratorMessages.id, messageId),
+									...bodyColumns({ id: true, contentJson: true, parentToolUseId: true }),
+								})
+								.sync(),
+						);
+						if (!existing) throw new NotFoundError("Assistant message", messageId);
+						if (isHistoryProtectedContent(existing.contentJson)) return undefined;
+						if (block.type === "tool_use") {
+							const adopted = sqlite
+								.query<
+									{ cleared: number },
+									[string, string]
+								>(`SELECT (${CLEARED_TOOL_OUTPUT_SQL}) AS cleared
+								FROM narrator_tool_calls WHERE message_id = ? AND tool_use_id = ?
+								ORDER BY execution_attempt DESC, created_at DESC, id DESC LIMIT 1`)
+								.get(messageId, block.id);
+							if (adopted?.cleared) return undefined;
+						}
 
-			type StoredAssistantBlock =
-				| {
-						type: "text";
-						text: string;
-						outputIndex?: number;
-						citations?: import("@shared/citations").TextCitation[];
-						fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
-						id?: string;
-						revision?: number;
-						rawTextLength?: number;
-						completed?: boolean;
-				  }
-				| {
-						type: "reasoning";
-						text: string;
-						id?: string;
-						revision?: number;
-						rawTextLength?: number;
-						completed?: boolean;
-						providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
-						outputIndex?: number;
-				  }
-				| {
-						type: "redacted_thinking";
-						data: string;
-						outputIndex?: number;
-						signatureSource?: string;
-				  }
-				| {
-						type: "tool_use";
-						id: string;
-						name: string;
-						input: Record<string, unknown>;
-						streamStartedAt?: number;
-						streamCompletedAt?: number;
-						outputIndex?: number;
-						thoughtSignature?: string;
-						thoughtSignatureSource?: string;
-				  }
-				| {
-						type: "web_search";
-						id: string;
-						query?: string;
-						queries?: string[];
-						outputIndex?: number;
-				  }
-				| { type: string; text?: unknown; outputIndex?: unknown; [key: string]: unknown };
-			const current = (
-				Array.isArray(existing.contentJson) ? existing.contentJson : []
-			) as StoredAssistantBlock[];
-			let content: StoredAssistantBlock[];
-			const matchingIndex =
-				(block.type === "text" || block.type === "reasoning") && block.id
-					? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
-					: -1;
-			if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
-				const previous = current[matchingIndex] as Record<string, unknown>;
-				const stale =
-					typeof previous.revision === "number" &&
-					(block.revision == null || block.revision < previous.revision);
-				const next: Record<string, unknown> = {
-					...previous,
-					...Object.fromEntries(Object.entries(block).filter(([, value]) => value !== undefined)),
-				};
-				if (block.type === "reasoning" && block.providerMetadata) {
-					next.providerMetadata = mergeReasoningMetadata(
-						previous.providerMetadata as ReasoningProviderMetadata | undefined,
-						block.providerMetadata,
-					);
-				}
-				if (previous.text !== block.text) delete next.translatedText;
-				if (stale || isDeepStrictEqual(previous, next)) {
-					content = current;
-				} else {
-					// A checkpoint updates the original chronological slot, even when its
-					// metadata arrives after a tool has already been committed.
-					content = [...current];
-					content[matchingIndex] = next as StoredAssistantBlock;
-				}
-			} else if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
-				const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
-					const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
-					return typeof outputIndex === "number" ? outputIndex : undefined;
-				};
-				// ECMAScript's stable sort preserves arrival order for ties/unindexed blocks;
-				// avoid the former wrapper object + two extra arrays for every checkpoint.
-				content = [...current, block as StoredAssistantBlock];
-				content.sort((a, b) => {
-					const aOrder = getOutputIndex(a) ?? Number.POSITIVE_INFINITY;
-					const bOrder = getOutputIndex(b) ?? Number.POSITIVE_INFINITY;
-					return aOrder === bOrder ? 0 : aOrder - bOrder;
-				});
-			} else {
-				// Unindexed providers/checkpoints already arrive in occurrence order. Do not
-				// pull later reasoning in front of text/tools that were actually seen first.
-				content = [...current, block];
-			}
-			if (content === current && !options?.republishUnchanged) return undefined;
-			const writeLedgerRow = () => {
-				if (block.type === "tool_use")
-					toolCallId = insertToolCallRowTx(tx, {
-						narratorId,
-						messageId,
-						parentSegmentId: toolParentSegmentId,
-						block,
-						createdAt: toolCreatedAt,
-					});
-			};
-			// One item changed: its block row (and the tool's ledger binding) follows.
-			const stamp = { attemptId: options?.attemptId };
-			if (content !== current) {
-				const textParts: string[] = [];
-				for (const entry of content)
-					if (entry.type === "text" && typeof entry.text === "string") textParts.push(entry.text);
-				const contentText = textParts.join("\n");
-				writeEnvelopeBody(tx, messageId, content, {
-					set: {
-						contextCharsJson: measureMessageCharacters("assistant", content),
-						contentText: contentText || null,
+						type StoredAssistantBlock =
+							| {
+									type: "text";
+									text: string;
+									outputIndex?: number;
+									citations?: import("@shared/citations").TextCitation[];
+									fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
+									id?: string;
+									revision?: number;
+									rawTextLength?: number;
+									completed?: boolean;
+							  }
+							| {
+									type: "reasoning";
+									text: string;
+									id?: string;
+									revision?: number;
+									rawTextLength?: number;
+									completed?: boolean;
+									providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
+									outputIndex?: number;
+							  }
+							| {
+									type: "redacted_thinking";
+									data: string;
+									outputIndex?: number;
+									signatureSource?: string;
+							  }
+							| {
+									type: "tool_use";
+									id: string;
+									name: string;
+									input: Record<string, unknown>;
+									streamStartedAt?: number;
+									streamCompletedAt?: number;
+									outputIndex?: number;
+									thoughtSignature?: string;
+									thoughtSignatureSource?: string;
+							  }
+							| {
+									type: "web_search";
+									id: string;
+									query?: string;
+									queries?: string[];
+									outputIndex?: number;
+							  }
+							| { type: string; text?: unknown; outputIndex?: unknown; [key: string]: unknown };
+						const current = (
+							Array.isArray(existing.contentJson) ? existing.contentJson : []
+						) as StoredAssistantBlock[];
+						let content: StoredAssistantBlock[];
+						const matchingIndex =
+							(block.type === "text" || block.type === "reasoning") && block.id
+								? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
+								: -1;
+						if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
+							const previous = current[matchingIndex] as Record<string, unknown>;
+							const stale =
+								typeof previous.revision === "number" &&
+								(block.revision == null || block.revision < previous.revision);
+							const next: Record<string, unknown> = {
+								...previous,
+								...Object.fromEntries(
+									Object.entries(block).filter(([, value]) => value !== undefined),
+								),
+							};
+							if (block.type === "reasoning" && block.providerMetadata) {
+								next.providerMetadata = mergeReasoningMetadata(
+									previous.providerMetadata as ReasoningProviderMetadata | undefined,
+									block.providerMetadata,
+								);
+							}
+							if (previous.text !== block.text) delete next.translatedText;
+							if (stale || isDeepStrictEqual(previous, next)) {
+								content = current;
+							} else {
+								// A checkpoint updates the original chronological slot, even when its
+								// metadata arrives after a tool has already been committed.
+								content = [...current];
+								content[matchingIndex] = next as StoredAssistantBlock;
+							}
+						} else if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
+							const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
+								const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
+								return typeof outputIndex === "number" ? outputIndex : undefined;
+							};
+							// ECMAScript's stable sort preserves arrival order for ties/unindexed blocks;
+							// avoid the former wrapper object + two extra arrays for every checkpoint.
+							content = [...current, block as StoredAssistantBlock];
+							content.sort((a, b) => {
+								const aOrder = getOutputIndex(a) ?? Number.POSITIVE_INFINITY;
+								const bOrder = getOutputIndex(b) ?? Number.POSITIVE_INFINITY;
+								return aOrder === bOrder ? 0 : aOrder - bOrder;
+							});
+						} else {
+							// Unindexed providers/checkpoints already arrive in occurrence order. Do not
+							// pull later reasoning in front of text/tools that were actually seen first.
+							content = [...current, block];
+						}
+						if (content === current && !options?.republishUnchanged) return undefined;
+						const writeLedgerRow = () => {
+							if (block.type === "tool_use")
+								toolCallId = insertToolCallRowTx(tx, {
+									narratorId,
+									messageId,
+									parentSegmentId: toolParentSegmentId,
+									block,
+									createdAt: toolCreatedAt,
+								});
+						};
+						// One item changed: its block row (and the tool's ledger binding) follows.
+						const stamp = { attemptId: options?.attemptId };
+						if (content !== current) {
+							const textParts: string[] = [];
+							for (const entry of content)
+								if (entry.type === "text" && typeof entry.text === "string")
+									textParts.push(entry.text);
+							const contentText = textParts.join("\n");
+							writeEnvelopeBody(tx, messageId, content, {
+								set: {
+									contextCharsJson: measureMessageCharacters("assistant", content),
+									contentText: contentText || null,
+								},
+								mode: "streaming",
+								stamp,
+								rows: writeLedgerRow,
+							});
+							queueContextCharacterRefresh(narratorId, messageId);
+						} else {
+							writeLedgerRow();
+							syncEnvelopeNow(messageId, "streaming", stamp);
+						}
+						flushQueuedSince(queueMark);
+						return existing;
 					},
-					mode: "streaming",
-					stamp,
-					rows: writeLedgerRow,
-				});
-				queueContextCharacterRefresh(narratorId, messageId);
-			} else {
-				writeLedgerRow();
-				syncEnvelopeNow(messageId, "streaming", stamp);
-			}
-			flushQueuedSince(queueMark);
-			return existing;
-		});
+					{ behavior: "immediate" },
+				),
+			{ label: "appendBlockToMessage", maxRetries: 5 },
+		);
 		if (!persisted) return undefined;
 		const existing = persisted;
 
@@ -2945,6 +3103,7 @@ const sqliteNarratorPersistence = {
 		updates: {
 			planReflectionAutoApproveOverride?: BooleanOverride;
 			dangerReflectionOverride?: DangerReflectionOverride;
+			questionReflectionOverride?: BooleanOverride;
 			autoContinuationOverride?: AutoContinuationOverride;
 			tasksReminderIntervalOverride?: number | null;
 		},
@@ -2997,7 +3156,14 @@ const sqliteNarratorPersistence = {
 		const requestedSubstatus =
 			options?.substatus ?? (status === "working" || status === "waiting" ? [] : undefined);
 		const isError = requestedSubstatus?.includes("error");
-		const keepsErrorMessage = isError || requestedSubstatus?.includes("payment_required");
+		// Timed-wait details share this existing column with errors. They must survive
+		// reloads while parked, but disappear on recovery/interruption like other waits.
+		const keepsWaitMessage =
+			status === "waiting" &&
+			(requestedSubstatus?.includes("quota_exhausted") ||
+				requestedSubstatus?.includes("model_unavailable"));
+		const keepsErrorMessage =
+			isError || requestedSubstatus?.includes("payment_required") || keepsWaitMessage;
 		const now = new Date().toISOString();
 		const nowMs = new Date(now).getTime();
 		const normalizedErrorMessage = keepsErrorMessage ? (errorMessage ?? null) : null;
@@ -3755,58 +3921,61 @@ const sqliteNarratorPersistence = {
 			const parentSegmentId =
 				(await findExecutionSegmentParent(narratorId))?.executionSegmentId ?? null;
 			// The new attempt and its execution segment are one transaction.
-			const toolCall = db.transaction((tx) => {
-				const queueMark = syncQueueMark();
-				const latest = tx.query.narratorToolCalls
-					.findFirst({
-						where: and(
-							eq(narratorToolCalls.messageId, messageId),
-							eq(narratorToolCalls.toolUseId, source.toolUseId),
-						),
-						orderBy: [desc(narratorToolCalls.executionAttempt)],
-						columns: { id: true, executionAttempt: true },
-					})
-					.sync();
-				// Repeating an old request must not allocate a second successor attempt.
-				if (latest && latest.executionAttempt > source.executionAttempt) {
-					throw new ValidationError("This tool call already has a newer execution attempt");
-				}
-				const id = generateId();
-				const createdAt = new Date().toISOString();
-				const executionAttempt = Math.max(
-					1,
-					(latest?.executionAttempt ?? source.executionAttempt) + 1,
-				);
-				const executionSegmentId = insertExecutionSegmentTx(tx, {
-					narratorId,
-					parentSegmentId,
-					toolCallId: id,
-					attempt: executionAttempt,
-					createdAt,
-				});
-				const [created] = tx
-					.insert(narratorToolCalls)
-					.values({
-						id,
+			const toolCall = db.transaction(
+				(tx) => {
+					const queueMark = syncQueueMark();
+					const latest = tx.query.narratorToolCalls
+						.findFirst({
+							where: and(
+								eq(narratorToolCalls.messageId, messageId),
+								eq(narratorToolCalls.toolUseId, source.toolUseId),
+							),
+							orderBy: [desc(narratorToolCalls.executionAttempt)],
+							columns: { id: true, executionAttempt: true },
+						})
+						.sync();
+					// Repeating an old request must not allocate a second successor attempt.
+					if (latest && latest.executionAttempt > source.executionAttempt) {
+						throw new ValidationError("This tool call already has a newer execution attempt");
+					}
+					const id = generateId();
+					const createdAt = new Date().toISOString();
+					const executionAttempt = Math.max(
+						1,
+						(latest?.executionAttempt ?? source.executionAttempt) + 1,
+					);
+					const executionSegmentId = insertExecutionSegmentTx(tx, {
 						narratorId,
-						messageId,
-						toolUseId: source.toolUseId,
-						toolName: source.toolName,
-						inputJson: source.inputJson,
-						inputChars: source.inputChars,
-						executionIdentityVersion: 1,
-						executionAttempt,
-						executionSegmentId,
-						status: "initializing",
+						parentSegmentId,
+						toolCallId: id,
+						attempt: executionAttempt,
 						createdAt,
-						// Deliberately no operation, approval, timing, result, token accounting or tree data.
-					})
-					.returning()
-					.all();
-				// The new attempt reopens its tool block in the same commit.
-				flushQueuedSince(queueMark);
-				return created;
-			});
+					});
+					const [created] = tx
+						.insert(narratorToolCalls)
+						.values({
+							id,
+							narratorId,
+							messageId,
+							toolUseId: source.toolUseId,
+							toolName: source.toolName,
+							inputJson: source.inputJson,
+							inputChars: source.inputChars,
+							executionIdentityVersion: 1,
+							executionAttempt,
+							executionSegmentId,
+							status: "initializing",
+							createdAt,
+							// Deliberately no operation, approval, timing, result, token accounting or tree data.
+						})
+						.returning()
+						.all();
+					// The new attempt reopens its tool block in the same commit.
+					flushQueuedSince(queueMark);
+					return created;
+				},
+				{ behavior: "immediate" },
+			);
 			return {
 				toolCall,
 				requiresFreshPermission: shared || source.narratorId !== narratorId,
@@ -4005,6 +4174,8 @@ const sqliteNarratorPersistence = {
 			input?: Record<string, unknown>;
 			/** Commit publication intent with the exact tool result, synchronously. */
 			onPersist?: (tx: DbTx) => void;
+			/** Recovery explanations may update only an active row, never a terminal result. */
+			onlyIfActive?: boolean;
 		},
 		messageId?: string,
 		toolCallId?: string,
@@ -4036,55 +4207,74 @@ const sqliteNarratorPersistence = {
 			);
 			if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
 		}
-		const affectedToolCalls = db.transaction((tx) => {
-			const queueMark = syncQueueMark();
-			const updated = tx
-				.update(narratorToolCalls)
-				.set({
-					outputJson: result.output ?? null,
-					outputChars: measureSerializedCharacters(result.output ?? result.errorMessage ?? null),
-					status: result.status,
-					errorMessage: result.errorMessage ?? null,
-					permissionStartedAt:
-						typeof result.permissionStartedAt === "number"
-							? new Date(result.permissionStartedAt).toISOString()
-							: undefined,
-					executionStartedAt:
-						typeof result.executionStartedAt === "number"
-							? new Date(result.executionStartedAt).toISOString()
-							: undefined,
-					...(result.preserveTiming
-						? {}
-						: {
-								durationMs: result.durationMs ?? null,
-								completedAt:
-									typeof result.completedAt === "number"
-										? new Date(result.completedAt).toISOString()
-										: new Date().toISOString(),
-							}),
-					...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
-				})
-				.where(and(...conditions))
-				.returning({
-					id: narratorToolCalls.id,
-					narratorId: narratorToolCalls.narratorId,
-					messageId: narratorToolCalls.messageId,
-					toolUseId: narratorToolCalls.toolUseId,
-					toolName: narratorToolCalls.toolName,
-					executionDeviceId: narratorToolCalls.executionDeviceId,
-				})
-				.all();
-			if (expected && updated.length !== 1) {
-				throw new ValidationError("Tool execution binding is stale or belongs to another narrator");
-			}
-			// A redirected or sanitized input is stored with the result it produced.
-			if (result.input !== undefined)
-				for (const row of updated) overwriteToolInputTx(tx, row.id, toolUseId, result.input);
-			result.onPersist?.(tx);
-			// The settled tool block (phase, binding, searchable result) commits with it.
-			flushQueuedSince(queueMark);
-			return updated;
-		});
+		if (result.onlyIfActive)
+			conditions.push(
+				ne(narratorToolCalls.status, "success"),
+				ne(narratorToolCalls.status, "fail"),
+			);
+		const affectedToolCalls = db.transaction(
+			(tx) => {
+				const queueMark = syncQueueMark();
+				if (
+					sqlite
+						.query(`SELECT 1 FROM narrator_tool_calls WHERE id = ? AND ${CLEARED_TOOL_OUTPUT_SQL}`)
+						.get(exactId)
+				)
+					return [];
+				const updated = tx
+					.update(narratorToolCalls)
+					.set({
+						outputJson: result.output ?? null,
+						outputChars: measureSerializedCharacters(result.output ?? result.errorMessage ?? null),
+						status: result.status,
+						errorMessage: result.errorMessage ?? null,
+						permissionStartedAt:
+							typeof result.permissionStartedAt === "number"
+								? new Date(result.permissionStartedAt).toISOString()
+								: undefined,
+						executionStartedAt:
+							typeof result.executionStartedAt === "number"
+								? new Date(result.executionStartedAt).toISOString()
+								: undefined,
+						...(result.preserveTiming
+							? {}
+							: {
+									durationMs: result.durationMs ?? null,
+									completedAt:
+										typeof result.completedAt === "number"
+											? new Date(result.completedAt).toISOString()
+											: new Date().toISOString(),
+								}),
+						...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
+					})
+					.where(and(...conditions))
+					.returning({
+						id: narratorToolCalls.id,
+						narratorId: narratorToolCalls.narratorId,
+						messageId: narratorToolCalls.messageId,
+						toolUseId: narratorToolCalls.toolUseId,
+						toolName: narratorToolCalls.toolName,
+						executionDeviceId: narratorToolCalls.executionDeviceId,
+					})
+					.all();
+				// Another writer already settled or retired this receipt. A recovery
+				// explanation must not replace it or trigger another publication commit.
+				if (result.onlyIfActive && updated.length === 0) return [];
+				if (expected && updated.length !== 1) {
+					throw new ValidationError(
+						"Tool execution binding is stale or belongs to another narrator",
+					);
+				}
+				// A redirected or sanitized input is stored with the result it produced.
+				if (result.input !== undefined)
+					for (const row of updated) overwriteToolInputTx(tx, row.id, toolUseId, result.input);
+				result.onPersist?.(tx);
+				// The settled tool block (phase, binding, searchable result) commits with it.
+				flushQueuedSince(queueMark);
+				return updated;
+			},
+			{ behavior: "immediate" },
+		);
 
 		// Announce the terminal state with bounded metadata only. External clients need to see
 		// "which tool ran on which device, how long it took, did it fail" to follow along; without
@@ -4259,13 +4449,16 @@ const sqliteNarratorPersistence = {
 		}
 		const now = new Date().toISOString();
 		const refreshedRecipients: string[] = [];
-		const result = db.transaction((tx) => {
-			const queueMark = syncQueueMark();
-			const id = rewrite(tx);
-			flushQueuedSince(queueMark);
-			options.afterWrite?.(tx, id);
-			return id;
-		});
+		const result = db.transaction(
+			(tx) => {
+				const queueMark = syncQueueMark();
+				const id = rewrite(tx);
+				flushQueuedSince(queueMark);
+				options.afterWrite?.(tx, id);
+				return id;
+			},
+			{ behavior: "immediate" },
+		);
 		function rewrite(tx: DbTx): string {
 			const original = readEnvelope(tx, messageId);
 			if (!original) throw new NotFoundError("Message", messageId);
@@ -4297,7 +4490,7 @@ const sqliteNarratorPersistence = {
 			};
 			const updateOriginal = () => {
 				if (overrides && Object.keys(overrides).length > 0) {
-					updateEnvelope(tx, messageId, overrides);
+					updateEnvelope(tx, messageId, overrides, { allowHistoryRewrite: !!overrides.editedAt });
 					if (semanticEdit)
 						updateRecipientMessageRef(tx, narratorId, currentRef.id, {
 							kind: "semantic_edit",
@@ -4493,20 +4686,32 @@ const sqliteNarratorPersistence = {
 			Object.entries(meta).filter(([, value]) => value !== undefined),
 		);
 		// The step is complete: items it left incomplete are interrupted, not streaming.
-		db.transaction((tx) => {
-			const queueMark = syncQueueMark();
-			updateEnvelope(tx, messageId, updates, { mode: "sealed" });
-			flushQueuedSince(queueMark);
-		});
+		// 这一步是 assistant_message 的封口写：一次 BUSY 会把整个 loop 判死，
+		// 与其它写路径一样交给带退避的 withDbRetry。
+		await withDbRetry(
+			async () =>
+				db.transaction(
+					(tx) => {
+						const queueMark = syncQueueMark();
+						updateEnvelope(tx, messageId, updates, { mode: "sealed" });
+						flushQueuedSince(queueMark);
+					},
+					{ behavior: "immediate" },
+				),
+			{ label: "patchStepMeta", maxRetries: 5 },
+		);
 	},
 
 	/** Seal a step's blocks without changing its metadata (a kept partial after a stop). */
 	sealStepBlocks(messageId: string): void {
-		db.transaction(() => {
-			const queueMark = syncQueueMark();
-			syncEnvelopeNow(messageId, "sealed");
-			flushQueuedSince(queueMark);
-		});
+		db.transaction(
+			() => {
+				const queueMark = syncQueueMark();
+				syncEnvelopeNow(messageId, "sealed");
+				flushQueuedSince(queueMark);
+			},
+			{ behavior: "immediate" },
+		);
 	},
 
 	/** Put a sealed step's tool_use blocks into the model's call order. */
@@ -4516,14 +4721,17 @@ const sqliteNarratorPersistence = {
 		content: unknown[],
 		contentText: string | null,
 	): Promise<void> {
-		db.transaction((tx) => {
-			const queueMark = syncQueueMark();
-			writeEnvelopeBody(tx, messageId, content, {
-				set: { contextCharsJson: measureMessageCharacters("assistant", content, contentText) },
-				mode: "sealed",
-			});
-			flushQueuedSince(queueMark);
-		});
+		db.transaction(
+			(tx) => {
+				const queueMark = syncQueueMark();
+				writeEnvelopeBody(tx, messageId, content, {
+					set: { contextCharsJson: measureMessageCharacters("assistant", content, contentText) },
+					mode: "sealed",
+				});
+				flushQueuedSince(queueMark);
+			},
+			{ behavior: "immediate" },
+		);
 		queueContextCharacterRefresh(narratorId, messageId);
 	},
 
@@ -4698,49 +4906,62 @@ const sqliteNarratorPersistence = {
 		narratorId: string,
 		summary: string,
 		contextPercent?: number,
-		options?: { status?: "compacted" | "failed"; error?: string },
+		options?: {
+			status?: "compacted" | "failed";
+			error?: string;
+			workState?: ContextWorkState;
+			workStateLocale?: string;
+		},
 	) {
 		const now = new Date().toISOString();
 		const status = options?.status ?? "compacted";
-
-		const [countRow] = await db
-			.select({ cnt: sql<number>`count(*)` })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.segmentCompactId, messageId),
-				),
-			);
-		const messageCount = countRow?.cnt ?? 0;
-
-		const block: Record<string, unknown> = {
-			type: "segment_compact",
-			status,
-			summary,
-			messageCount,
-		};
-		if (status === "failed" && options?.error) {
-			block.error = options.error;
+		const workState =
+			options?.workState === undefined ? null : parseContextWorkState(options.workState);
+		if (status === "compacted") {
+			if (!summary.trim())
+				throw new ValidationError("Cannot finalize compact with an empty summary");
+			if (options?.workState !== undefined && (!workState || workState.narratorId !== narratorId)) {
+				throw new ValidationError("Invalid or mismatched context work-state snapshot");
+			}
+			if (workState)
+				summary = `${summary}\n\n${renderContextWorkState(workState, options?.workStateLocale ?? "en")}`;
 		}
 
-		const prefix = status === "failed" ? "[Segment Compact Failed]" : "[Segment Compact]";
-
 		return db.transaction((tx) => {
-			const written = writeEnvelopeBody(tx, messageId, [block], {
-				set: {
-					contextCharsJson: measureMessageCharacters("user", [block]),
-					contentText: `${prefix}\n${summary}`,
-					contextPercent: contextPercent ?? null,
-				},
-				where: eq(narratorMessages.narratorId, narratorId),
-			});
-			const updated = written ? readEnvelope(tx, messageId) : undefined;
-			if (!updated) return null;
-
-			if (status === "failed") {
+			// Reference ownership, pending state and hidden membership are one atomic decision.
+			const ref = tx.query.narratorMessageRefs
+				.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+					columns: { seq: true },
+				})
+				.sync();
+			if (!ref) return null;
+			const body = readEnvelopeBody(tx, messageId);
+			const previous = Array.isArray(body)
+				? body.find((block) => block.type === "segment_compact")
+				: undefined;
+			if (!previous) throw new ValidationError("Message is not a segment compact message");
+			if (previous.status !== "compacting") return null;
+			const countRow = tx
+				.select({ cnt: sql<number>`count(*)` })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.segmentCompactId, messageId),
+					),
+				)
+				.get();
+			const messageCount = countRow?.cnt ?? 0;
+			if (status === "compacted" && (messageCount === 0 || messageCount !== previous.messageCount))
+				return null;
+			const copied = copyMessageForNarratorTx(tx, narratorId, messageId);
+			if (copied.messageId !== messageId) {
 				tx.update(narratorMessageRefs)
-					.set({ segmentCompactId: null })
+					.set({ segmentCompactId: copied.messageId })
 					.where(
 						and(
 							eq(narratorMessageRefs.narratorId, narratorId),
@@ -4749,7 +4970,40 @@ const sqliteNarratorPersistence = {
 					)
 					.run();
 			}
-
+			const block: Record<string, unknown> = {
+				type: "segment_compact",
+				status,
+				summary,
+				messageCount,
+				...(status === "compacted" && workState ? { workState } : {}),
+				...(status === "failed" && options?.error ? { error: options.error } : {}),
+			};
+			const prefix = status === "failed" ? "[Segment Compact Failed]" : "[Segment Compact]";
+			const written = writeEnvelopeBody(tx, copied.messageId, [block], {
+				set: {
+					contextCharsJson: measureMessageCharacters("user", [block]),
+					contentText: `${prefix}\n${summary}`,
+					contextPercent: status === "compacted" ? (contextPercent ?? null) : null,
+				},
+			});
+			const updated = written ? readEnvelope(tx, copied.messageId) : undefined;
+			if (!updated)
+				throw new AppError(
+					"Segment compact marker changed before finalize",
+					409,
+					"COMPACT_FINALIZE_CONFLICT",
+				);
+			if (status === "failed") {
+				tx.update(narratorMessageRefs)
+					.set({ segmentCompactId: null })
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.segmentCompactId, copied.messageId),
+						),
+					)
+					.run();
+			}
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -4759,18 +5013,7 @@ const sqliteNarratorPersistence = {
 				})
 				.where(eq(narrators.id, narratorId))
 				.run();
-
-			const ref = tx.query.narratorMessageRefs
-				.findFirst({
-					where: and(
-						eq(narratorMessageRefs.messageId, messageId),
-						eq(narratorMessageRefs.narratorId, narratorId),
-					),
-					columns: { seq: true },
-				})
-				.sync();
-
-			return { ...updated, seq: ref?.seq };
+			return { ...updated, seq: ref.seq };
 		});
 	},
 
@@ -4902,6 +5145,7 @@ const sqliteNarratorPersistence = {
 		const now = new Date().toISOString();
 		db.transaction((tx) => {
 			writeEnvelopeBody(tx, messageId, [newBlock], {
+				allowHistoryRewrite: true,
 				set: {
 					contextCharsJson: measureMessageCharacters("user", [newBlock]),
 					contentText: `[Segment Compact]\n${summary}`,
